@@ -13,11 +13,3 @@ pluginManagement {
 
 rootProject.name = "inertia-compose"
 include("lib")
-
-dependencyResolutionManagement {
-    versionCatalogs {
-        create("libs") {
-            // from(files("gradle/libs.versions.toml"))
-        }
-    }
-}
