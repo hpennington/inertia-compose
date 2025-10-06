@@ -3,14 +3,24 @@ package org.inertiagraphics.inertia
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.IntSize
+import kotlin.math.abs
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -223,6 +233,9 @@ data class MessageActionablesWrapper(val type: String, val payload: MessageActio
 data class MessageSchemaWrapper(val type: String, val payload: MessageSchema)
 
 @Serializable
+data class MessageTranslationWrapper(val type: String, val payload: MessageTranslation)
+
+@Serializable
 data class MessageActionables(
     val tree: TreeDTO,
     val actionableIds: Set<String>
@@ -244,6 +257,13 @@ data class InertiaSchemaWrapper(
 @Serializable
 data class MessageSchema(
     val schemaWrappers: List<InertiaSchemaWrapper>
+)
+
+@Serializable
+data class MessageTranslation(
+    val translationX: Float,
+    val translationY: Float,
+    val actionableIds: Set<String>
 )
 
 // ========== WEBSOCKET CLIENT ==========
@@ -290,6 +310,11 @@ class WebSocketClient private constructor() : WebSocketListener() {
         sendJson(wrapper)
     }
 
+    fun sendMessageTranslation(message: MessageTranslation) {
+        val wrapper = MessageTranslationWrapper("translationEnded", message)
+        sendJson(wrapper)
+    }
+
     private fun sendJson(wrapper: Any) {
         if (!isConnected || socket == null) return
         try {
@@ -298,6 +323,7 @@ class WebSocketClient private constructor() : WebSocketListener() {
                 is MessageActionableWrapper -> json.encodeToString(wrapper.payload)
                 is MessageActionablesWrapper -> json.encodeToString(wrapper.payload)
                 is MessageSchemaWrapper -> json.encodeToString(wrapper.payload)
+                is MessageTranslationWrapper -> json.encodeToString(wrapper.payload)
                 else -> return
             }
 
@@ -309,6 +335,7 @@ class WebSocketClient private constructor() : WebSocketListener() {
                 is MessageActionableWrapper -> "actionable"
                 is MessageActionablesWrapper -> "actionables"
                 is MessageSchemaWrapper -> "schema"
+                is MessageTranslationWrapper -> "translationEnded"
                 else -> return
             }
 
@@ -373,6 +400,7 @@ class WebSocketClient private constructor() : WebSocketListener() {
 // ========== COMPOSITION LOCALS ==========
 
 private val LocalInertiaDataModel = compositionLocalOf<InertiaDataModel?> { null }
+private val LocalUpdateModel = compositionLocalOf<((InertiaDataModel) -> InertiaDataModel) -> Unit> { {} }
 private val LocalInertiaParentId = compositionLocalOf<String?> { null }
 private val LocalInertiaContainerId = compositionLocalOf<String?> { null }
 private val LocalInertiaIsContainer = compositionLocalOf<Boolean> { false }
@@ -405,6 +433,14 @@ fun InertiaContainer(
             )
         )
     }
+
+    // Create a stable reference to update model that can be called from children
+    val updateModel = remember {
+        { updater: (InertiaDataModel) -> InertiaDataModel ->
+            model = updater(model)
+        }
+    }
+
     var size by remember { mutableStateOf(IntSize.Zero) }
 
     LaunchedEffect(model.tree, baseURL) {
@@ -453,6 +489,7 @@ fun InertiaContainer(
         CompositionLocalProvider(
             LocalCanvasSize provides size,
             LocalInertiaDataModel provides model,
+            LocalUpdateModel provides updateModel,
             LocalInertiaParentId provides id,
             LocalInertiaContainerId provides id,
             LocalInertiaIsContainer provides true
@@ -480,6 +517,7 @@ fun Inertiaable(
     content: @Composable () -> Unit
 ) {
     val model = LocalInertiaDataModel.current
+    val updateModel = LocalUpdateModel.current
     val parentId = LocalInertiaParentId.current
     val isContainer = LocalInertiaIsContainer.current
     val canvasSize = LocalCanvasSize.current
@@ -487,6 +525,7 @@ fun Inertiaable(
     val indexMap = SharedIndexManager.indexMap
     var hierarchyId by remember { mutableStateOf<String?>(null) }
     var isSelected by remember { mutableStateOf(false) }
+    var dragOffset by remember { mutableStateOf(Offset.Zero) }
 
     LaunchedEffect(hierarchyIdPrefix) {
         val next = (indexMap[hierarchyIdPrefix] ?: 0)
@@ -594,24 +633,99 @@ fun Inertiaable(
         }
     }
 
-    val clickableModifier = Modifier
-        .then(modifierSelectedBorder(isSelected && (model?.isActionable == true)))
-        .clickable(enabled = model?.isActionable == true) {
-            val id = hierarchyId ?: return@clickable
-            val m = model ?: return@clickable
-            val set = m.actionableIds.toMutableSet()
-            if (set.contains(id)) set.remove(id) else set.add(id)
+    // When in actionable mode, handle both tap (for selection) and drag (for translation)
+    val interactionModifier = if (model?.isActionable == true) {
+        Modifier.pointerInput(Unit) {
+            awaitEachGesture {
+                val down = awaitFirstDown()
+                val downPosition = down.position
+                var totalDrag = Offset.Zero
+                var hasDragged = false
 
-            val newModel = m.copyMutable { actionableIds = set }
-            WebSocketClient.shared.sendMessageActionables("actionables",
-                MessageActionables(
-                    tree = newModel.tree.toDTO(),
-                    actionableIds = newModel.actionableIds.toSet()
-                )
-            )
+                // Wait for either drag or up
+                do {
+                    val event = awaitPointerEvent()
+                    val dragEvent = event.changes.firstOrNull()
+
+                    if (dragEvent != null) {
+                        val dragChange = dragEvent.positionChange()
+                        totalDrag += dragChange
+
+                        // Consider it a drag if moved more than 10 pixels
+                        if (abs(totalDrag.x) > 10f || abs(totalDrag.y) > 10f) {
+                            hasDragged = true
+
+                            // Only drag if selected
+                            if (isSelected) {
+                                dragOffset += dragChange
+                                dragEvent.consume()
+                            }
+                        }
+                    }
+                } while (event.changes.any { it.pressed })
+
+                // On release
+                if (hasDragged && isSelected && canvasSize != IntSize.Zero) {
+                    // Send drag translation
+                    val m = model
+                    if (m != null) {
+                        WebSocketClient.shared.sendMessageTranslation(
+                            MessageTranslation(
+                                translationX = dragOffset.x / canvasSize.width,
+                                translationY = dragOffset.y / canvasSize.height,
+                                actionableIds = m.actionableIds.toSet()
+                            )
+                        )
+                    }
+                } else if (!hasDragged) {
+                    // It was a tap, toggle selection
+                    val id = hierarchyId
+                    val m = model
+                    if (id != null && m != null) {
+                        val newActionableIds = m.actionableIds.toMutableSet()
+                        if (newActionableIds.contains(id)) {
+                            newActionableIds.remove(id)
+                        } else {
+                            newActionableIds.add(id)
+                        }
+
+                        // Update UI immediately (like React does)
+                        updateModel { prev ->
+                            prev.copyMutable { actionableIds = newActionableIds }
+                        }
+
+                        // Send updated selection to WebSocket
+                        WebSocketClient.shared.sendMessageActionables("actionables",
+                            MessageActionables(
+                                tree = m.tree.toDTO(),
+                                actionableIds = newActionableIds.toSet()
+                            )
+                        )
+                    }
+                }
+            }
         }
+    } else {
+        Modifier
+    }
 
-    Box(modifier = modifierWithAnim.then(clickableModifier)) {
+    Box(
+        modifier = modifierWithAnim
+            .then(
+                if (isSelected && model?.isActionable == true && dragOffset != Offset.Zero) {
+                    Modifier.offset {
+                        androidx.compose.ui.unit.IntOffset(
+                            dragOffset.x.toInt(),
+                            dragOffset.y.toInt()
+                        )
+                    }
+                } else {
+                    Modifier
+                }
+            )
+            .then(modifierSelectedBorder(isSelected && (model?.isActionable == true)))
+            .then(interactionModifier)
+    ) {
         CompositionLocalProvider(
             LocalInertiaParentId provides hierarchyId
         ) {
