@@ -621,9 +621,12 @@ private fun interpolate(
 /// the only way play can pick up mid-loop.
 internal fun InertiaAnimationSchema.valuesAtTime(
     time: Float,
-    loopDuration: Float
+    loopDuration: Float,
+    isRepeating: Boolean = true
 ): InertiaAnimationValues {
-    val track = keyframesFilling(loopDuration)
+    // A run that plays once is as long as its own track — padding it to the loop
+    // would only hold it at the end, which is what the loop is for.
+    val track = if (isRepeating) keyframesFilling(loopDuration) else playableKeyframes()
     var previous = initialValues.sanitized()
 
     if (track.isEmpty()) return previous
@@ -688,8 +691,22 @@ class InertiaPlayback internal constructor() {
     var playheadTime: Float by mutableFloatStateOf(0f)
         private set
 
+    /// Whether a run is on screen: playing, or holding the frame it finished on.
+    /// Not the same as the clock ticking — a run that has played once and stopped
+    /// still holds its final values.
     var isRunning: Boolean by mutableStateOf(false)
         private set
+
+    /// Whether the clock is advancing. What the container's frame loop follows.
+    internal var isTicking: Boolean by mutableStateOf(false)
+        private set
+
+    /// Whether tracks repeat once they reach the end of the loop.
+    ///
+    /// Set by the app. A repeating run wraps at [playbackDuration] and every
+    /// track is padded out to it, so actionables of different lengths restart
+    /// together; a run that plays once stops at the end and holds there.
+    var isRepeating: Boolean by mutableStateOf(true)
 
     /// Where the editor has parked the playhead, while it is parked there.
     /// Non-nil means the run is being scrubbed or paused rather than played.
@@ -903,7 +920,9 @@ class InertiaPlayback internal constructor() {
     /// paused at — rather than from the top; only a playhead parked at the very
     /// end of the loop starts over, since there is nothing left to play.
     private fun startClock() {
-        if (isRunning) return
+        // The ticking flag, not `isRunning`: a non-repeating run that has played
+        // out is still on screen, and has to be startable again.
+        if (isTicking) return
 
         // Nothing loaded yet: there is no animation for the playhead to follow.
         if (schemas.isEmpty()) {
@@ -918,18 +937,20 @@ class InertiaPlayback internal constructor() {
         playheadTime = runOffset
         runStartNanos = null
         isRunning = true
+        isTicking = true
         report(isRunning = true)
     }
 
     private fun stopClock() {
         isRunning = false
+        isTicking = false
         runStartNanos = null
     }
 
     /// Advances the playhead. Driven by the container's frame loop, which runs
     /// only while [isRunning].
     internal fun tick(frameNanos: Long) {
-        if (!isRunning) return
+        if (!isTicking) return
 
         val start = runStartNanos
         if (start == null) {
@@ -940,6 +961,17 @@ class InertiaPlayback internal constructor() {
         // Read each frame: the timeline can be resized mid-run.
         val duration = playbackDuration
         val elapsed = runOffset + (frameNanos - start) / 1_000_000_000f
+
+        // A run that plays once ends here, holding its final frame: the clock
+        // stops but the run stays on screen, which is what `isRunning` says.
+        // Starting it again is the app's call.
+        if (!isRepeating && elapsed >= duration) {
+            playheadTime = duration
+            isTicking = false
+            runStartNanos = null
+            report(isRunning = false)
+            return
+        }
 
         playheadTime = if (duration > 0f) elapsed % duration else 0f
         report(isRunning = true)
@@ -1074,10 +1106,10 @@ fun InertiaContainer(
         playback.setSchemas(model.inertiaSchemas.toMap())
     }
 
-    // The clock. Keyed on `isRunning` so a paused or unstarted container is not
-    // holding the frame loop open.
-    LaunchedEffect(playback.isRunning) {
-        if (!playback.isRunning) return@LaunchedEffect
+    // The clock. Keyed on `isTicking` so a paused container — or one holding the
+    // last frame of a run that plays once — is not holding the frame loop open.
+    LaunchedEffect(playback.isTicking) {
+        if (!playback.isTicking) return@LaunchedEffect
 
         while (isActive) {
             withFrameNanos { playback.tick(it) }
@@ -1200,7 +1232,11 @@ fun Inertiaable(
                     isPlayable && (playback.isRunning || playback.seekTime != null)
 
                 val v = if (isShowingTrack) {
-                    animation.valuesAtTime(playback.playheadTime, playback.playbackDuration)
+                    animation.valuesAtTime(
+                        playback.playheadTime,
+                        playback.playbackDuration,
+                        playback.isRepeating
+                    )
                 } else {
                     animation.initialValues.sanitized()
                 }

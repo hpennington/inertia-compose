@@ -98,6 +98,27 @@ class PlaybackTrackTest {
         assertEquals(1f, subject.valuesAtTime(2.5f, 3f).translate[0], 0.0001f)
     }
 
+    /// A run that plays once is as long as its own track, so it reaches its final
+    /// values when the track ends rather than being stretched across the loop.
+    @Test
+    fun `a track that plays once is not padded to the loop`() {
+        val subject = schema(
+            keyframes = listOf(InertiaAnimationKeyframe(id = "a", values = values(1f), duration = 1f))
+        )
+
+        // Half a second in: halfway along its own track, but only a sixth of the
+        // way through a three-second loop.
+        val once = subject.valuesAtTime(0.5f, 3f, isRepeating = false)
+        val looping = subject.valuesAtTime(0.5f, 3f, isRepeating = true)
+
+        assertEquals(0.5f, once.translate[0], 0.0001f)
+        assertEquals(0.5f, looping.translate[0], 0.0001f)
+
+        // Past the end of the track both hold, but only the padded one was ever
+        // going to still be moving.
+        assertEquals(1f, subject.valuesAtTime(1f, 3f, isRepeating = false).translate[0], 0.0001f)
+    }
+
     /// Eased in and out of every segment, approximating the cubic keyframes the
     /// iOS runtime plays — so the midpoint is halfway and the quarter point is
     /// not.
