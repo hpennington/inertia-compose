@@ -1012,10 +1012,14 @@ fun InertiaContainer(
     LaunchedEffect(model.tree, baseURL) {
         val ws = WebSocketClient.shared
 
-        val host = "192.168.64.1"
-        val finalUrl = if (host != null) baseURL.replace("127.0.0.1", host) else baseURL
+        // The URL the app passed, as passed. This used to rewrite `127.0.0.1` to
+        // a hardcoded address for one particular emulator network, which is not
+        // something the runtime can know — an app that needs a different host
+        // (`10.0.2.2` from a stock emulator, a LAN address from a device) says so
+        // in `baseURL`.
+        InertiaLog.debug("connecting to $baseURL")
 
-        ws.connect(url = finalUrl) {
+        ws.connect(url = baseURL) {
             val msg = MessageActionables(
                 tree = model.tree.toDTO(),
                 actionableIds = model.actionableIds.toSet()
