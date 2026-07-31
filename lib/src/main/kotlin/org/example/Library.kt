@@ -2,6 +2,7 @@ package org.inertiagraphics.inertia
 
 import android.util.Log
 import androidx.compose.animation.core.*
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
@@ -14,17 +15,29 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.geometry.isSpecified
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
+import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.toSize
 import kotlin.math.abs
 import kotlin.math.pow
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.isActive
@@ -359,9 +372,44 @@ class WebSocketClient private constructor() : WebSocketListener() {
     companion object {
         val shared: WebSocketClient by lazy { WebSocketClient() }
         private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
+
+        /// How long to wait before dialing the editor again, backing off from the
+        /// first to the second. The editor is usually not up yet when the app
+        /// launches, and it can be restarted under a running app, so a dial that
+        /// is never retried means a dev session that silently never connects.
+        /// Backing off keeps a runtime left running against no editor from
+        /// dialing at full speed forever, while staying quick enough that
+        /// starting the editor attaches within a few seconds.
+        private const val reconnectBaseDelayMs = 500L
+        private const val reconnectMaxDelayMs = 4_000L
+
+        private const val normalClosureStatus = 1000
     }
 
+    /// One client for the process. Every `newWebSocket` off it is a separate
+    /// connection, and rebuilding the client per dial would throw away the
+    /// connection pool and dispatcher threads on every retry.
+    private val client = OkHttpClient.Builder()
+        .pingInterval(20, TimeUnit.SECONDS)
+        .build()
+
+    /// Guards the connection state below, which is touched both from whatever
+    /// thread calls `connect`/`disconnect` and from OkHttp's callback thread.
+    private val connectionLock = Any()
+
+    /// Written only under the lock, but read without it by the send path, which
+    /// runs on the frame clock and has no business blocking on a dial.
+    @Volatile
     private var socket: WebSocket? = null
+    private var url: String? = null
+    private var reconnectJob: Job? = null
+    private var reconnectAttempt = 0
+
+    /// True from the moment a dial is handed to OkHttp until it opens or fails,
+    /// so repeated `connect` calls cannot stack sockets up on a slow dial.
+    private var isDialing = false
+
+    @Volatile
     var isConnected: Boolean = false
         private set
 
@@ -380,14 +428,83 @@ class WebSocketClient private constructor() : WebSocketListener() {
     private val scope = CoroutineScope(Dispatchers.IO)
     private var onConnected: (() -> Unit)? = null
 
+    /// Asks to be connected to the editor, and to stay connected: a drop is
+    /// redialed until `disconnect`. Safe to call repeatedly — a call made while a
+    /// connection is up, in flight, or waiting out a backoff only re-arms
+    /// `onConnect`, which every open runs so the editor is resynced after a
+    /// reconnect as well as after the first dial.
     fun connect(url: String, onConnect: () -> Unit = {}) {
-        if (isConnected) return
-        val client = OkHttpClient.Builder()
-            .pingInterval(20, TimeUnit.SECONDS)
-            .build()
-        val request = Request.Builder().url(url).build()
-        socket = client.newWebSocket(request, this)
-        onConnected = onConnect
+        val shouldDial = synchronized(connectionLock) {
+            onConnected = onConnect
+
+            if (url != this.url) {
+                // The endpoint moved, so whatever is open or scheduled belongs to
+                // the old one. Dropping the socket here means its own callback
+                // finds itself stale and leaves the redial below alone.
+                this.url = url
+                reconnectJob?.cancel()
+                reconnectJob = null
+                reconnectAttempt = 0
+                socket?.close(normalClosureStatus, null)
+                socket = null
+                isConnected = false
+                isDialing = false
+            }
+
+            !isConnected && !isDialing && reconnectJob == null
+        }
+
+        if (shouldDial) dial()
+    }
+
+    private fun dial() {
+        synchronized(connectionLock) {
+            val target = url ?: return
+            if (isConnected || isDialing) return
+
+            InertiaLog.debug("dialing editor at $target")
+            isDialing = true
+            val request = Request.Builder().url(target).build()
+            // Assigned under the lock so a callback that lands immediately still
+            // finds the socket it is reporting on, rather than reading itself as
+            // stale against the previous one.
+            socket = client.newWebSocket(request, this)
+        }
+    }
+
+    private fun scheduleReconnect() {
+        synchronized(connectionLock) {
+            if (url == null || reconnectJob != null) return
+
+            val delayMs = (reconnectBaseDelayMs * 2.0.pow(reconnectAttempt))
+                .toLong()
+                .coerceIn(reconnectBaseDelayMs, reconnectMaxDelayMs)
+            reconnectAttempt += 1
+
+            reconnectJob = scope.launch {
+                delay(delayMs)
+                synchronized(connectionLock) { reconnectJob = null }
+                dial()
+            }
+        }
+    }
+
+    /// Stops dialing and drops the connection. Nothing in the runtime calls this
+    /// — a container that leaves composition leaves the socket up for the next
+    /// one — but a host that tears the runtime down needs a way out of the retry
+    /// loop.
+    fun disconnect() {
+        synchronized(connectionLock) {
+            url = null
+            onConnected = null
+            reconnectJob?.cancel()
+            reconnectJob = null
+            reconnectAttempt = 0
+            socket?.close(normalClosureStatus, null)
+            socket = null
+            isConnected = false
+            isDialing = false
+        }
     }
 
     fun sendMessageActionables(type: String, message: MessageActionables) {
@@ -458,8 +575,16 @@ class WebSocketClient private constructor() : WebSocketListener() {
     }
 
     override fun onOpen(webSocket: WebSocket, response: Response) {
-        isConnected = true
-        onConnected?.invoke()
+        val onConnect = synchronized(connectionLock) {
+            if (webSocket !== socket) return
+            isConnected = true
+            isDialing = false
+            reconnectAttempt = 0
+            onConnected
+        }
+
+        InertiaLog.debug("editor connected")
+        onConnect?.invoke()
     }
 
     override fun onMessage(webSocket: WebSocket, text: String) {
@@ -502,13 +627,41 @@ class WebSocketClient private constructor() : WebSocketListener() {
         onMessage(webSocket, bytes.string(StandardCharsets.UTF_8))
     }
 
+    /// The editor going away sends a close that has to be answered before the
+    /// connection actually finishes; without this it sits half-closed and the
+    /// redial waits on a socket that is never coming back.
+    override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+        webSocket.close(normalClosureStatus, null)
+    }
+
     override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-        isConnected = false
+        handleDisconnect(webSocket, "closed ($code)")
     }
 
     override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-        isConnected = false
-        t.printStackTrace()
+        handleDisconnect(webSocket, t.message ?: t.toString())
+    }
+
+    /// Both ways a connection can end, plus a dial that never opened at all —
+    /// the editor not being up yet, which is the normal case at launch. Ignores
+    /// any socket the client has already moved on from, so a close that arrives
+    /// after a redial was decided on cannot schedule a second one.
+    private fun handleDisconnect(webSocket: WebSocket, reason: String) {
+        val wasConnected = synchronized(connectionLock) {
+            if (webSocket !== socket) return
+
+            val wasConnected = isConnected
+            isConnected = false
+            isDialing = false
+            socket = null
+            wasConnected
+        }
+
+        // A dial against an editor that is not running yet fails on every retry,
+        // so only a connection that was actually up is worth a line.
+        if (wasConnected) InertiaLog.debug("editor disconnected: $reason — will retry")
+
+        scheduleReconnect()
     }
 }
 
@@ -989,12 +1142,127 @@ class InertiaPlayback internal constructor() {
     }
 }
 
+// ========== ALIGNMENT GRID ==========
+
+/// The alignment overlay's state, held per [InertiaContainer] and written by the
+/// actionable being dragged.
+///
+/// Kept out of [InertiaDataModel] on purpose: that model is replaced wholesale on
+/// every write, which would rebuild the schema map and re-run the container's
+/// effects on every frame of a drag. This holds nothing but what the overlay
+/// draws, so a drag repaints the grid and leaves the rest of the tree alone.
+@Stable
+class InertiaGuideState {
+    /// Whether a drag is in progress, i.e. whether the overlay is drawn at all.
+    var showGrid by mutableStateOf(false)
+        private set
+
+    /// The dragged node's center in the container's coordinate space, including
+    /// the drag so far. Guides are drawn from this, so it has to be an absolute
+    /// position rather than a translation — a node need not be laid out at the
+    /// container's center.
+    var selectedNodeCenter by mutableStateOf(Offset.Zero)
+        private set
+
+    var selectedNodeSize by mutableStateOf(Size.Zero)
+        private set
+
+    /// The container's own coordinates, so an actionable can express its position
+    /// in the same space the overlay draws in. Read from layout and gesture
+    /// callbacks rather than composition, so a plain field is enough.
+    var containerCoordinates: LayoutCoordinates? = null
+
+    fun show(center: Offset, size: Size) {
+        selectedNodeCenter = center
+        selectedNodeSize = size
+        showGrid = true
+    }
+
+    fun hide() {
+        showGrid = false
+    }
+}
+
+private val guideColor = Color.Cyan
+private val crosshairColor = Color.Red
+
+/// Dashed guides tracking the dragged node's edges and center within the
+/// container, over a crosshair through the container's own center.
+@Composable
+private fun InertiaAlignmentGrid(guides: InertiaGuideState, modifier: Modifier = Modifier) {
+    Canvas(modifier) {
+        val width = 1.dp.toPx()
+
+        drawLine(
+            color = crosshairColor,
+            start = Offset(size.width / 2f, 0f),
+            end = Offset(size.width / 2f, size.height),
+            strokeWidth = width
+        )
+        drawLine(
+            color = crosshairColor,
+            start = Offset(0f, size.height / 2f),
+            end = Offset(size.width, size.height / 2f),
+            strokeWidth = width
+        )
+
+        val node = guides.selectedNodeSize
+        val center = guides.selectedNodeCenter
+        // Skip a node that has not been laid out yet, and any NaN that a drag
+        // being set up mid-layout can hand us.
+        if (!node.isSpecified || node.width <= 0f || node.height <= 0f) return@Canvas
+        if (!center.isSpecified || center.x.isNaN() || center.y.isNaN()) return@Canvas
+
+        val dash = PathEffect.dashPathEffect(floatArrayOf(4.dp.toPx(), 4.dp.toPx()))
+
+        listOf(
+            center.x - node.width / 2f to false,
+            center.x to true,
+            center.x + node.width / 2f to false
+        ).forEach { (x, isCenter) ->
+            drawLine(
+                color = guideColor,
+                start = Offset(x, 0f),
+                end = Offset(x, size.height),
+                strokeWidth = width,
+                alpha = if (isCenter) 1f else 0.5f,
+                pathEffect = if (isCenter) null else dash
+            )
+        }
+
+        listOf(
+            center.y - node.height / 2f to false,
+            center.y to true,
+            center.y + node.height / 2f to false
+        ).forEach { (y, isCenter) ->
+            drawLine(
+                color = guideColor,
+                start = Offset(0f, y),
+                end = Offset(size.width, y),
+                strokeWidth = width,
+                alpha = if (isCenter) 1f else 0.5f,
+                pathEffect = if (isCenter) null else dash
+            )
+        }
+
+        drawRect(
+            color = guideColor,
+            topLeft = Offset(center.x - node.width / 2f, center.y - node.height / 2f),
+            size = node,
+            style = Stroke(width = width, pathEffect = dash)
+        )
+    }
+}
+
 // ========== COMPOSITION LOCALS ==========
 
 /// Playback for the enclosing [InertiaContainer].
 val LocalInertia = staticCompositionLocalOf<InertiaPlayback> {
     error("LocalInertia was read outside of an InertiaContainer.")
 }
+
+/// The alignment overlay of the enclosing [InertiaContainer].
+private val LocalInertiaGuides = compositionLocalOf<InertiaGuideState?> { null }
 
 private val LocalInertiaDataModel = compositionLocalOf<InertiaDataModel?> { null }
 private val LocalUpdateModel = compositionLocalOf<((InertiaDataModel) -> InertiaDataModel) -> Unit> { {} }
@@ -1040,6 +1308,7 @@ fun InertiaContainer(
     var size by remember { mutableStateOf(IntSize.Zero) }
 
     val playback = remember { InertiaPlayback() }
+    val guides = remember { InertiaGuideState() }
 
     LaunchedEffect(model.tree, baseURL) {
         val ws = WebSocketClient.shared
@@ -1120,16 +1389,27 @@ fun InertiaContainer(
         modifier = Modifier
             .wrapContentSize()
             .onSizeChanged { size = it }
+            // The frame the guides are measured against, so a position taken in
+            // an actionable and a point drawn in the overlay share an origin.
+            .onGloballyPositioned { guides.containerCoordinates = it }
     ) {
         CompositionLocalProvider(
             LocalInertia provides playback,
             LocalCanvasSize provides size,
             LocalInertiaDataModel provides model,
             LocalUpdateModel provides updateModel,
+            LocalInertiaGuides provides guides,
             LocalInertiaParentId provides id,
             LocalInertiaContainerId provides id,
             LocalInertiaIsContainer provides true
         ) { content() }
+
+        if (guides.showGrid) {
+            // `matchParentSize` rather than `fillMaxSize`: the container wraps its
+            // content, and an overlay that took part in that measurement would
+            // grow it to the whole screen.
+            InertiaAlignmentGrid(guides, Modifier.matchParentSize())
+        }
     }
 }
 
@@ -1155,6 +1435,7 @@ fun Inertiaable(
     val model = LocalInertiaDataModel.current
     val updateModel = LocalUpdateModel.current
     val playback = LocalInertia.current
+    val guides = LocalInertiaGuides.current
     val parentId = LocalInertiaParentId.current
     val isContainer = LocalInertiaIsContainer.current
     val canvasSize = LocalCanvasSize.current
@@ -1163,6 +1444,13 @@ fun Inertiaable(
     var hierarchyId by remember { mutableStateOf<String?>(null) }
     var isSelected by remember { mutableStateOf(false) }
     var dragOffset by remember { mutableStateOf(Offset.Zero) }
+
+    /// This node's laid-out center in the container's coordinate space, before any
+    /// drag offset, and the size the guides box in. Measured outermost in the
+    /// modifier chain — outside both the drag offset and the animation layer — so
+    /// it stays the layout position rather than the drawn one.
+    val baseCenter = remember { mutableStateOf(Offset.Zero) }
+    val nodeSize = remember { mutableStateOf(Size.Zero) }
 
     LaunchedEffect(hierarchyIdPrefix) {
         val next = (indexMap[hierarchyIdPrefix] ?: 0)
@@ -1222,7 +1510,7 @@ fun Inertiaable(
             // composition. Both see the same values, but a read out here would
             // recompose and re-lay out every actionable on every frame of every
             // run; deferred to the layer, a frame only re-runs this block.
-            Modifier.graphicsLayer {
+            val sample = {
                 // Playback is keyed by prefix, so every actionable authored
                 // against the same id runs off the one the app started.
                 val isPlayable = playback.isPlaying(hierarchyIdPrefix)
@@ -1231,7 +1519,7 @@ fun Inertiaable(
                 val isShowingTrack =
                     isPlayable && (playback.isRunning || playback.seekTime != null)
 
-                val v = if (isShowingTrack) {
+                if (isShowingTrack) {
                     animation.valuesAtTime(
                         playback.playheadTime,
                         playback.playbackDuration,
@@ -1240,15 +1528,33 @@ fun Inertiaable(
                 } else {
                     animation.initialValues.sanitized()
                 }
-
-                translationX = v.translate.getOrElse(0) { 0f } * canvasSize.width
-                translationY = v.translate.getOrElse(1) { 0f } * canvasSize.height
-                rotationZ = v.rotateCenter
-                scaleX = v.scale
-                scaleY = v.scale
-                alpha = v.opacity
-                transformOrigin = TransformOrigin.Center
             }
+
+            // `rotate` pivots on the top left corner and `rotateCenter` on the
+            // center, and a layer carries a single transformOrigin — so the two
+            // rotations want a layer each. Chained modifiers wrap outermost-first,
+            // the order the SwiftUI runtime stacks its own modifiers in, so the
+            // same schema composes the same matrix on both: offset, rotateCenter
+            // and opacity outside, then rotate, then scale against the content.
+            Modifier
+                .graphicsLayer {
+                    val v = sample()
+                    translationX = v.translate.getOrElse(0) { 0f } * canvasSize.width
+                    translationY = v.translate.getOrElse(1) { 0f } * canvasSize.height
+                    rotationZ = v.rotateCenter
+                    alpha = v.opacity
+                    transformOrigin = TransformOrigin.Center
+                }
+                .graphicsLayer {
+                    rotationZ = sample().rotate
+                    transformOrigin = TransformOrigin(0f, 0f)
+                }
+                .graphicsLayer {
+                    val scale = sample().scale
+                    scaleX = scale
+                    scaleY = scale
+                    transformOrigin = TransformOrigin.Center
+                }
         }
     }
 
@@ -1277,6 +1583,10 @@ fun Inertiaable(
                             // Only drag if selected
                             if (isSelected) {
                                 dragOffset += dragChange
+                                guides?.show(
+                                    center = baseCenter.value + dragOffset,
+                                    size = nodeSize.value
+                                )
                                 dragEvent.consume()
                             }
                         }
@@ -1284,6 +1594,8 @@ fun Inertiaable(
                 } while (event.changes.any { it.pressed })
 
                 // On release
+                guides?.hide()
+
                 if (hasDragged && isSelected && canvasSize != IntSize.Zero) {
                     // Send drag translation
                     val m = model
@@ -1331,7 +1643,22 @@ fun Inertiaable(
     }
 
     Box(
-        modifier = modifierWithAnim
+        modifier = Modifier
+            // Ahead of the animation layer and the drag offset, so what lands here
+            // is where layout put this node, which is what `dragOffset` is added
+            // to. Anything measured after them reports the *drawn* position and
+            // the guides would chase themselves.
+            .onGloballyPositioned { coordinates ->
+                val container = guides.containerCoordinates ?: return@onGloballyPositioned
+                val origin = coordinates.positionInRoot() - container.positionInRoot()
+                val bounds = coordinates.size.toSize()
+                nodeSize.value = bounds
+                baseCenter.value = Offset(
+                    x = origin.x + bounds.width / 2f,
+                    y = origin.y + bounds.height / 2f
+                )
+            }
+            .then(modifierWithAnim)
             .then(
                 if (isSelected && model?.isActionable == true && dragOffset != Offset.Zero) {
                     Modifier.offset {
