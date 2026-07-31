@@ -5,16 +5,20 @@ plugins {
     kotlin("plugin.serialization") version "2.2.0"
 }
 
-kotlin {
-    jvmToolchain(17)
-}
-
 android {
     namespace = "org.inertiagraphics.inertia"
     compileSdk = 34
 
     defaultConfig {
         minSdk = 26
+    }
+
+    // Targets 17 without pinning the JDK that builds it, so the demo app can
+    // pull this in as an included build on whatever JDK it already runs on.
+    // jitpack still builds it on the openjdk17 its config asks for.
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
     }
 
     buildFeatures {
