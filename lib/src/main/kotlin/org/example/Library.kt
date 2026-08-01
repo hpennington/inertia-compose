@@ -1620,6 +1620,22 @@ fun Inertiaable(
     /// whether or not the animation is playing.
     val shapes = animation?.shapes ?: emptyList()
 
+    // The animation layer below already puts this node where the schema says it
+    // starts, so the drag stacked on top of it goes back to zero whenever those
+    // values change: by then the gesture has been authored into the schema, and
+    // leaving it in place would count the same move twice. It is also what
+    // returns a node to the origin when the editor resets an animation's initial
+    // values — until this, a reset changed the authored animation and left the
+    // node sitting wherever it had last been dragged to.
+    //
+    // Keyed on the values themselves rather than on the model instance, which is
+    // replaced wholesale on every update: any other change — a selection, say —
+    // would otherwise drop a drag the editor has not been told about yet,
+    // snapping the node out from under the finger.
+    LaunchedEffect(animation?.initialValues) {
+        dragOffset = Offset.Zero
+    }
+
     // An animation starts as soon as the runtime holds its schema, or waits for
     // the app, depending on its `invokeType` — which is why this waits on the
     // schema rather than on the actionable registering.
