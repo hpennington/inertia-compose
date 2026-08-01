@@ -14,6 +14,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.IntSize
@@ -317,10 +320,21 @@ internal fun List<InertiaShape>.vertexData(bounds: Rect): FloatArray {
 /// Measured as zero-sized, so a surface larger than the card cannot grow the
 /// card it backs; Compose does not clip a child that overflows unless asked to,
 /// which is what lets those two things be true at once.
+///
+/// A canvas given an [animation] holds one shape's own drawing rather than the
+/// actionable's backdrop: the surface carries that track's layer transforms,
+/// stacked on top of the actionable's own because it sits inside them.
+/// [hierarchyIdPrefix] is the actionable the shape belongs to, which is what
+/// says whether that actionable has been triggered, and [containerSize] is what
+/// a translation of 1 crosses — the same measure the actionable's own animation
+/// is offset by.
 @Composable
 internal fun InertiaShapeCanvas(
     shapes: List<InertiaShape>,
-    actionableSize: IntSize
+    actionableSize: IntSize,
+    animation: InertiaAnimationSchema? = null,
+    hierarchyIdPrefix: String? = null,
+    containerSize: IntSize = IntSize.Zero
 ) {
     val bounds = remember(shapes) { shapes.bounds() } ?: return
 
@@ -339,7 +353,8 @@ internal fun InertiaShapeCanvas(
         content = {
             AndroidView(
                 factory = { context -> InertiaShapeTextureView(context) },
-                update = { view -> view.vertexData = vertexData }
+                update = { view -> view.vertexData = vertexData },
+                modifier = shapeAnimationModifier(animation, hierarchyIdPrefix, containerSize)
             )
         }
     ) { measurables, _ ->
@@ -350,4 +365,68 @@ internal fun InertiaShapeCanvas(
             placeables.forEach { it.place(left, top) }
         }
     }
+}
+
+/// The layers that move a shape drawn on its own track, or nothing at all for a
+/// shape that is part of the actionable's backdrop.
+///
+/// Read at the same playhead as everything else, so a shape moves in time with
+/// the actionable it was authored behind rather than on a clock of its own — and
+/// is padded to the same loop, so the two come round together. What it does not
+/// share is the actionable's `invokeType`: a shape animation marked `auto` runs
+/// as soon as the clock does, even while the actionable it backs is still
+/// waiting on the app to trigger it.
+///
+/// The layers are stacked exactly as [InertiaActionable] stacks its own, for the
+/// reasons set out there: the playhead is read inside the layer blocks rather
+/// than in composition, and the two rotations want a layer each because they
+/// pivot on different points.
+@Composable
+private fun shapeAnimationModifier(
+    animation: InertiaAnimationSchema?,
+    hierarchyIdPrefix: String?,
+    containerSize: IntSize
+): Modifier {
+    val playback = LocalInertia.current
+
+    if (animation == null || containerSize == IntSize.Zero) return Modifier
+
+    val sample = {
+        val isTriggered = hierarchyIdPrefix?.let { playback.isPlaying(it) } == true
+        val isPlayable = isTriggered || animation.invokeType == InertiaAnimationInvokeType.auto
+        // Scrubbing shows the animation without running it, which is why a
+        // parked playhead draws the same way a running one does.
+        val isShowingTrack = isPlayable && (playback.isRunning || playback.seekTime != null)
+
+        if (isShowingTrack) {
+            animation.valuesAtTime(
+                playback.playheadTime,
+                playback.playbackDuration,
+                playback.isRepeating
+            )
+        } else {
+            animation.initialValues.sanitized()
+        }
+    }
+
+    return Modifier
+        .graphicsLayer {
+            val v = sample()
+            translationX = v.translate.getOrElse(0) { 0f } * containerSize.width
+            translationY = v.translate.getOrElse(1) { 0f } * containerSize.height
+            rotationZ = v.rotateCenter
+            alpha = v.opacity
+            transformOrigin = TransformOrigin.Center
+            compositingStrategy = CompositingStrategy.ModulateAlpha
+        }
+        .graphicsLayer {
+            rotationZ = sample().rotate
+            transformOrigin = TransformOrigin(0f, 0f)
+        }
+        .graphicsLayer {
+            val scale = sample().scale
+            scaleX = scale
+            scaleY = scale
+            transformOrigin = TransformOrigin.Center
+        }
 }

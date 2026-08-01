@@ -151,4 +151,78 @@ class ShapeTest {
         assertEquals(emptyList(), InertiaShape(emptyList()).triangles())
         assertEquals(emptyList(), InertiaShape(listOf(corner(0f, 0f), corner(1f, 1f))).triangles())
     }
+
+    // -- Shapes that carry an animation --
+
+    /// The other way a shape is authored: a drawn vector, described rather than
+    /// spelled out corner by corner, with a track of its own attached — which is
+    /// what makes it move independently of the actionable it is drawn behind.
+    private val drawnJson = """
+    [
+      {
+        "id": "card2",
+        "initialValues": {"opacity": 1, "rotate": 0, "rotateCenter": 0, "scale": 1, "translate": [0, 0]},
+        "invokeType": "auto",
+        "keyframes": [],
+        "shapes": [
+          {
+            "shape": {"id": "123", "width": 2, "height": 2, "type": "rectangle"},
+            "animation": {
+              "id": "shape0",
+              "initialValues": {"opacity": 1, "rotate": 0, "rotateCenter": 0, "scale": 1, "translate": [0, 0]},
+              "invokeType": "auto",
+              "keyframes": [
+                {"id": "a", "duration": 0.001, "values": {"opacity": 1, "rotate": 0, "rotateCenter": 0, "scale": 1, "translate": [0.8, 0.9]}},
+                {"id": "b", "duration": 1.3, "values": {"opacity": 1, "rotate": 0, "rotateCenter": 0, "scale": 1, "translate": [-0.02, -0.05]}}
+              ],
+              "shapes": []
+            }
+          }
+        ]
+      }
+    ]
+    """.trimIndent()
+
+    private fun drawnShape(): InertiaShape =
+        json.decodeFromString<List<InertiaAnimationSchema>>(drawnJson).first().shapes.first()
+
+    /// A shape given a track keeps it: without this the vector is decoded and
+    /// drawn, and then sits still because the only animation that reached the
+    /// runtime was the actionable's.
+    @Test
+    fun `shape carries its own animation`() {
+        val animation = assertNotNull(drawnShape().animation)
+
+        assertEquals("shape0", animation.id)
+        assertEquals(InertiaAnimationInvokeType.auto, animation.invokeType)
+        assertEquals(2, animation.keyframes.size)
+        assertEquals(-0.02f, animation.keyframes.last().values.translate[0], tolerance)
+    }
+
+    /// A described shape has no corners on the wire; the ones it is drawn from
+    /// are worked out from the description. A rectangle is the two triangles of
+    /// a quad, so it reaches the renderer as six corners.
+    @Test
+    fun `described shape is drawn from its description`() {
+        val shape = drawnShape()
+
+        assertEquals(emptyList(), shape.vertices)
+        assertEquals(6, shape.resolvedVertices().size)
+        assertNotNull(listOf(shape).bounds())
+    }
+
+    /// Normalizing is about where a shape lands on the canvas, not about what it
+    /// then does — so the track has to come through it. It is the last thing to
+    /// touch a shape before the renderer, and a shape that lost its animation
+    /// here would be drawn in the right place and never move.
+    @Test
+    fun `normalizing keeps the shapes animation`() {
+        val shape = drawnShape()
+        val bounds = assertNotNull(listOf(shape).bounds())
+
+        val normalized = shape.normalized(bounds)
+
+        assertEquals("shape0", normalized.animation?.id)
+        assertEquals(shape.resolvedVertices().size, normalized.vertices.size)
+    }
 }

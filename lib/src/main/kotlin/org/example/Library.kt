@@ -38,6 +38,7 @@ import androidx.compose.ui.unit.toSize
 import androidx.compose.ui.zIndex
 import kotlin.math.abs
 import kotlin.math.pow
+import kotlin.math.sqrt
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -144,6 +145,21 @@ data class InertiaColor(
 @Serializable
 data class Vertex(val position: InertiaPoint, val color: InertiaColor)
 
+/// The kinds of vector a shape can be described as, rather than spelled out
+/// corner by corner. A bare string on the wire, like every other enum here.
+@Serializable
+enum class InertiaShapeType { rectangle, oval, triangle }
+
+/// A drawn vector as the editor records it: what it is and how big, in the same
+/// multiples of the actionable its corners would have been measured in.
+@Serializable
+data class InertiaShapeProperties(
+    val id: String,
+    val type: InertiaShapeType,
+    val width: Float,
+    val height: Float
+)
+
 /// A shape as it is authored alongside an animation: a ring of corners, each
 /// carrying its own colour, measured against the actionable it belongs to —
 /// (0, 0) that view's top-left, (1, 1) its bottom-right.
@@ -152,8 +168,18 @@ data class Vertex(val position: InertiaPoint, val color: InertiaColor)
 /// past the actionable and go on being drawn, because the canvas they land on
 /// is the container's rather than the view's: a shape three times the size of
 /// the card it backs is authored simply by saying 3.
+///
+/// A shape is authored one of two ways — [vertices], corner by corner, or
+/// [shape], a vector described and drawn from that description — and may carry
+/// an [animation] of its own, which is what makes it a drawing rather than a
+/// backdrop: the corners say what is drawn, the track says how it moves, and
+/// the actionable it was authored against carries both.
 @Serializable
-data class InertiaShape(val vertices: List<Vertex> = emptyList())
+data class InertiaShape(
+    val vertices: List<Vertex> = emptyList(),
+    val shape: InertiaShapeProperties? = null,
+    val animation: InertiaAnimationSchema? = null
+)
 
 @Serializable
 data class AnimationContainer(
@@ -707,10 +733,53 @@ object InertiaPlaybackDefaults {
     }
 }
 
+/// The colour a described vector is drawn in until the editor records one of
+/// its own. Shared with the Swift and WebGL runtimes, which draw the same
+/// placeholder.
+private val describedShapeColor = InertiaColor(red = 1f, green = 0f, blue = 0f, alpha = 1f)
+
+/// The ring of corners a described vector is drawn from, in the actionable's own
+/// units and centred on its top-left corner — the origin the description is
+/// measured from.
+///
+/// Matches the Swift and WebGL runtimes corner for corner, so one authored
+/// vector is the same drawing on all three. A rectangle comes out as the two
+/// triangles of a quad rather than four corners; the fan in [triangles]
+/// re-covers the same area from them.
+private fun InertiaShapeProperties.describedVertices(): List<Vertex> {
+    val size = maxOf(width, height)
+    fun corner(x: Float, y: Float) = Vertex(InertiaPoint(x, y), describedShapeColor)
+
+    if (type == InertiaShapeType.triangle) {
+        val height = size * sqrt(3f) / 2f
+        val halfBase = size / 2f
+        return listOf(
+            corner(0f, height / 2f),
+            corner(-halfBase, -height / 2f),
+            corner(halfBase, -height / 2f)
+        )
+    }
+
+    // An oval has no drawing of its own yet and is squared off, the way the
+    // other runtimes leave it.
+    val half = size / 2f
+    val topLeft = corner(-half, -half)
+    val topRight = corner(half, -half)
+    val bottomLeft = corner(-half, half)
+    val bottomRight = corner(half, half)
+    return listOf(topLeft, topRight, bottomRight, topLeft, bottomLeft, bottomRight)
+}
+
+/// The corners this shape is drawn from, however it was authored: the ones
+/// recorded against it, or the ones its description resolves to.
+internal fun InertiaShape.resolvedVertices(): List<Vertex> =
+    if (vertices.isNotEmpty()) vertices else shape?.describedVertices() ?: emptyList()
+
 /// The shape as the triangle list the GPU draws: a fan around the first corner,
 /// so three corners are a triangle and four a quad. Fewer than three enclose no
 /// area and contribute nothing.
 internal fun InertiaShape.triangles(): List<Vertex> {
+    val vertices = resolvedVertices()
     if (vertices.size < 3) return emptyList()
 
     return (1 until vertices.size - 1).flatMap {
@@ -733,7 +802,7 @@ internal fun InertiaShape.triangles(): List<Vertex> {
 /// Null when the shapes enclose no area, which is also when there is nothing to
 /// draw.
 internal fun List<InertiaShape>.bounds(): Rect? {
-    val positions = flatMap { shape -> shape.vertices.map { it.position } }
+    val positions = flatMap { shape -> shape.resolvedVertices().map { it.position } }
     val first = positions.firstOrNull() ?: return null
 
     var minX = first.x
@@ -755,11 +824,16 @@ internal fun List<InertiaShape>.bounds(): Rect? {
 /// The same shape restated against [bounds] — the canvas's own box — so (0, 0)
 /// is the canvas's top-left corner and (1, 1) its bottom-right, which is the
 /// space the renderer draws in.
+///
+/// The corners are resolved on the way through: whatever the shape was authored
+/// as, what comes out is the ring that lands in [bounds]. Its animation rides
+/// along, since normalizing is about where the shape is drawn and not about what
+/// it then does.
 internal fun InertiaShape.normalized(bounds: Rect): InertiaShape {
     if (bounds.width <= 0f || bounds.height <= 0f) return this
 
     return InertiaShape(
-        vertices = vertices.map { vertex ->
+        vertices = resolvedVertices().map { vertex ->
             Vertex(
                 position = InertiaPoint(
                     x = (vertex.position.x - bounds.left) / bounds.width,
@@ -767,7 +841,8 @@ internal fun InertiaShape.normalized(bounds: Rect): InertiaShape {
                 ),
                 color = vertex.color
             )
-        }
+        },
+        animation = animation
     )
 }
 
@@ -1865,8 +1940,30 @@ fun Inertiaable(
         // First in the box, so it draws behind the content it backs. Inside the
         // animation layer and the drag offset above, so both carry the shapes
         // along with the node rather than leaving them behind.
+        //
+        // A shape with no animation of its own is backdrop: it belongs to the
+        // actionable, moves only as the actionable moves, and shares one canvas
+        // with every other shape like it. A shape that was given a track is a
+        // drawing in its own right and gets a canvas of its own, so that track
+        // can move it without disturbing the actionable or the other shapes.
+        // The drawn ones come after, in the order they were authored — shapes
+        // have no z-index of their own, and the file's order is the only
+        // ordering anyone has expressed.
         if (shapes.isNotEmpty() && layoutSize != IntSize.Zero) {
-            InertiaShapeCanvas(shapes = shapes, actionableSize = layoutSize)
+            val backdrop = shapes.filter { it.animation == null }
+            if (backdrop.isNotEmpty()) {
+                InertiaShapeCanvas(shapes = backdrop, actionableSize = layoutSize)
+            }
+
+            shapes.filter { it.animation != null }.forEach { shape ->
+                InertiaShapeCanvas(
+                    shapes = listOf(shape),
+                    actionableSize = layoutSize,
+                    animation = shape.animation,
+                    hierarchyIdPrefix = hierarchyIdPrefix,
+                    containerSize = canvasSize
+                )
+            }
         }
 
         CompositionLocalProvider(
