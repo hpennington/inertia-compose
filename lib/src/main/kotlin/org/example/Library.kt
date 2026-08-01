@@ -15,9 +15,11 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.geometry.isSpecified
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.drawscope.DrawScope
@@ -29,9 +31,11 @@ import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.layout.positionInRoot
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.toSize
+import androidx.compose.ui.zIndex
 import kotlin.math.abs
 import kotlin.math.pow
 import kotlinx.coroutines.CoroutineScope
@@ -69,18 +73,17 @@ object InertiaLog {
     fun debug(message: String) {
         if (isEnabled) Log.d("Inertia", message)
     }
+
+    /// Something the runtime could not do at all — a GPU context that would not
+    /// come up, a shader that would not compile. Logged whether or not the
+    /// chatter is enabled, because it is the only account of why part of the
+    /// screen is missing.
+    fun error(message: String) {
+        Log.e("Inertia", message)
+    }
 }
 
 // ========== DATA MODELS ==========
-
-/// The retired wire format, where a container schema carried shape objects with
-/// an animation nested in each. The editor sends animation schemas on their own
-/// now — see [InertiaSchemaWrapper] — so nothing decodes into this any more.
-@Serializable
-data class InertiaSchema(
-    val id: String,
-    val objects: List<InertiaShape> = emptyList()
-)
 
 @Serializable
 data class InertiaCanvasSize(val width: Int, val height: Int)
@@ -118,30 +121,44 @@ data class InertiaAnimationSchema(
     val id: String,
     val initialValues: InertiaAnimationValues = InertiaAnimationValues(),
     val invokeType: InertiaAnimationInvokeType,
-    val keyframes: List<InertiaAnimationKeyframe> = emptyList()
+    val keyframes: List<InertiaAnimationKeyframe> = emptyList(),
+    /// What the actionable's canvas draws behind it. Defaulted, so an animation
+    /// recorded before shapes existed — or one that simply wants none — still
+    /// decodes.
+    val shapes: List<InertiaShape> = emptyList()
 )
+
+@Serializable
+data class InertiaPoint(val x: Float, val y: Float)
+
+@Serializable
+data class InertiaColor(
+    val red: Float,
+    val green: Float,
+    val blue: Float,
+    val alpha: Float
+)
+
+/// A single corner of a shape: where it sits, and what colour the shape is
+/// there.
+@Serializable
+data class Vertex(val position: InertiaPoint, val color: InertiaColor)
+
+/// A shape as it is authored alongside an animation: a ring of corners, each
+/// carrying its own colour, measured against the actionable it belongs to —
+/// (0, 0) that view's top-left, (1, 1) its bottom-right.
+///
+/// Nothing holds a shape to that box, though. Coordinates outside 0..1 reach
+/// past the actionable and go on being drawn, because the canvas they land on
+/// is the container's rather than the view's: a shape three times the size of
+/// the card it backs is authored simply by saying 3.
+@Serializable
+data class InertiaShape(val vertices: List<Vertex> = emptyList())
 
 @Serializable
 data class AnimationContainer(
     val actionableId: String,
     val containerId: String
-)
-
-@Serializable
-enum class InertiaObjectType { shape, animation }
-
-@Serializable
-data class InertiaShape(
-    val id: String,
-    val containerId: String,
-    val width: Float,
-    val height: Float,
-    val position: List<Float>,  // [x, y]
-    val color: List<Float>,
-    val shape: String,
-    val objectType: InertiaObjectType,
-    val zIndex: Int,
-    val animation: InertiaAnimationSchema
 )
 
 @Serializable
@@ -690,6 +707,70 @@ object InertiaPlaybackDefaults {
     }
 }
 
+/// The shape as the triangle list the GPU draws: a fan around the first corner,
+/// so three corners are a triangle and four a quad. Fewer than three enclose no
+/// area and contribute nothing.
+internal fun InertiaShape.triangles(): List<Vertex> {
+    if (vertices.size < 3) return emptyList()
+
+    return (1 until vertices.size - 1).flatMap {
+        listOf(vertices[0], vertices[it], vertices[it + 1])
+    }
+}
+
+/// The smallest box holding every corner of these shapes, in the units they are
+/// authored in — multiples of the actionable's own frame, so `(0, 0, 1, 1)` is
+/// exactly the actionable and `(0, 0, 3, 3)` three times it.
+///
+/// This is what the canvas is sized and placed by. Sizing it to the shapes
+/// rather than to the container is what keeps a shape whole: a canvas is a
+/// rectangle that rotates with the view it backs, so anything reaching past its
+/// edge is cut — and a canvas fitted to the container was already cutting a
+/// shape bigger than the container, then sweeping that straight edge through
+/// the artwork as the view turned. Fitted to the shapes, there is nothing
+/// outside it to lose.
+///
+/// Null when the shapes enclose no area, which is also when there is nothing to
+/// draw.
+internal fun List<InertiaShape>.bounds(): Rect? {
+    val positions = flatMap { shape -> shape.vertices.map { it.position } }
+    val first = positions.firstOrNull() ?: return null
+
+    var minX = first.x
+    var maxX = first.x
+    var minY = first.y
+    var maxY = first.y
+
+    positions.forEach { position ->
+        minX = minOf(minX, position.x)
+        maxX = maxOf(maxX, position.x)
+        minY = minOf(minY, position.y)
+        maxY = maxOf(maxY, position.y)
+    }
+
+    val bounds = Rect(left = minX, top = minY, right = maxX, bottom = maxY)
+    return if (bounds.width > 0f && bounds.height > 0f) bounds else null
+}
+
+/// The same shape restated against [bounds] — the canvas's own box — so (0, 0)
+/// is the canvas's top-left corner and (1, 1) its bottom-right, which is the
+/// space the renderer draws in.
+internal fun InertiaShape.normalized(bounds: Rect): InertiaShape {
+    if (bounds.width <= 0f || bounds.height <= 0f) return this
+
+    return InertiaShape(
+        vertices = vertices.map { vertex ->
+            Vertex(
+                position = InertiaPoint(
+                    x = (vertex.position.x - bounds.left) / bounds.width,
+                    y = (vertex.position.y - bounds.top) / bounds.height
+                ),
+                color = vertex.color
+            )
+        }
+    )
+}
+
 private val identityValues = InertiaAnimationValues()
 
 private fun InertiaAnimationValues.isFinite(): Boolean =
@@ -1144,42 +1225,55 @@ class InertiaPlayback internal constructor() {
 
 // ========== ALIGNMENT GRID ==========
 
+/// Off for now, and only in this runtime — the SwiftUI and web runtimes draw
+/// their grids.
+///
+/// The overlay spans the container and moves on every pointer event, so a drag
+/// repaints the whole surface at the frame rate. On the emulator this runtime is
+/// usually watched in, that costs enough frames that the node visibly stops
+/// tracking the pointer, which is worse than having no guides. The drawing below
+/// is correct and the drag path no longer recomposes; what is left is the cost of
+/// the repaint itself, which needs a cheaper way to put a full-container overlay
+/// on screen rather than another pass over this code. Flip this to put it back.
+private const val showAlignmentGrid = true
+
+/// Where the node being dragged sits in the container's coordinate space. An
+/// absolute position rather than a translation: the guides are drawn from it, and
+/// a node need not be laid out at the container's center.
+data class InertiaGuides(val center: Offset, val size: Size)
+
 /// The alignment overlay's state, held per [InertiaContainer] and written by the
 /// actionable being dragged.
 ///
 /// Kept out of [InertiaDataModel] on purpose: that model is replaced wholesale on
 /// every write, which would rebuild the schema map and re-run the container's
-/// effects on every frame of a drag. This holds nothing but what the overlay
-/// draws, so a drag repaints the grid and leaves the rest of the tree alone.
+/// effects on every frame of a drag.
+///
+/// One state object rather than a field each, because a drag writes this on every
+/// pointer event: one write is one invalidation, and it is only ever read from
+/// [InertiaAlignmentGrid]'s draw scope, so a drag repaints the overlay's layer
+/// without recomposing or re-laying out anything.
 @Stable
 class InertiaGuideState {
-    /// Whether a drag is in progress, i.e. whether the overlay is drawn at all.
-    var showGrid by mutableStateOf(false)
-        private set
-
-    /// The dragged node's center in the container's coordinate space, including
-    /// the drag so far. Guides are drawn from this, so it has to be an absolute
-    /// position rather than a translation — a node need not be laid out at the
-    /// container's center.
-    var selectedNodeCenter by mutableStateOf(Offset.Zero)
-        private set
-
-    var selectedNodeSize by mutableStateOf(Size.Zero)
+    /// Null when no drag is in progress, which is also when the overlay draws
+    /// nothing. The overlay itself stays composed either way — taking it in and
+    /// out of the tree would recompose the container, and with it the whole app's
+    /// content, at both ends of every drag.
+    var guides by mutableStateOf<InertiaGuides?>(null)
         private set
 
     /// The container's own coordinates, so an actionable can express its position
-    /// in the same space the overlay draws in. Read from layout and gesture
-    /// callbacks rather than composition, so a plain field is enough.
+    /// in the same space the overlay draws in. Read from gesture callbacks rather
+    /// than composition, so a plain field is enough — and has to be one, or every
+    /// layout pass would invalidate whoever read it.
     var containerCoordinates: LayoutCoordinates? = null
 
     fun show(center: Offset, size: Size) {
-        selectedNodeCenter = center
-        selectedNodeSize = size
-        showGrid = true
+        guides = InertiaGuides(center, size)
     }
 
     fun hide() {
-        showGrid = false
+        guides = null
     }
 }
 
@@ -1190,8 +1284,23 @@ private val crosshairColor = Color.Red
 /// container, over a crosshair through the container's own center.
 @Composable
 private fun InertiaAlignmentGrid(guides: InertiaGuideState, modifier: Modifier = Modifier) {
+    // Deliberately no `graphicsLayer` here. It would confine the overlay's
+    // redraws, but a container-sized layer is a container-sized offscreen buffer
+    // to allocate and composite every frame, which an emulator's renderer — where
+    // this runtime is usually being watched — pays for far more dearly than it
+    // saves.
     Canvas(modifier) {
+        val current = guides.guides ?: return@Canvas
+        val node = current.size
+        val center = current.center
+        // A node measured before its first layout, or mid-teardown, has nothing
+        // to draw guides against.
+        if (!node.isSpecified || node.width <= 0f || node.height <= 0f) return@Canvas
+        if (!center.isSpecified || center.x.isNaN() || center.y.isNaN()) return@Canvas
+
         val width = 1.dp.toPx()
+        val dash = 4.dp.toPx()
+        val dashEffect = PathEffect.dashPathEffect(floatArrayOf(dash, dash))
 
         drawLine(
             color = crosshairColor,
@@ -1206,52 +1315,72 @@ private fun InertiaAlignmentGrid(guides: InertiaGuideState, modifier: Modifier =
             strokeWidth = width
         )
 
-        val node = guides.selectedNodeSize
-        val center = guides.selectedNodeCenter
-        // Skip a node that has not been laid out yet, and any NaN that a drag
-        // being set up mid-layout can hand us.
-        if (!node.isSpecified || node.width <= 0f || node.height <= 0f) return@Canvas
-        if (!center.isSpecified || center.x.isNaN() || center.y.isNaN()) return@Canvas
+        drawGuide(center.x - node.width / 2f, isVertical = true, isCenter = false, width, dashEffect)
+        drawGuide(center.x, isVertical = true, isCenter = true, width, dashEffect)
+        drawGuide(center.x + node.width / 2f, isVertical = true, isCenter = false, width, dashEffect)
 
-        val dash = PathEffect.dashPathEffect(floatArrayOf(4.dp.toPx(), 4.dp.toPx()))
-
-        listOf(
-            center.x - node.width / 2f to false,
-            center.x to true,
-            center.x + node.width / 2f to false
-        ).forEach { (x, isCenter) ->
-            drawLine(
-                color = guideColor,
-                start = Offset(x, 0f),
-                end = Offset(x, size.height),
-                strokeWidth = width,
-                alpha = if (isCenter) 1f else 0.5f,
-                pathEffect = if (isCenter) null else dash
-            )
-        }
-
-        listOf(
-            center.y - node.height / 2f to false,
-            center.y to true,
-            center.y + node.height / 2f to false
-        ).forEach { (y, isCenter) ->
-            drawLine(
-                color = guideColor,
-                start = Offset(0f, y),
-                end = Offset(size.width, y),
-                strokeWidth = width,
-                alpha = if (isCenter) 1f else 0.5f,
-                pathEffect = if (isCenter) null else dash
-            )
-        }
+        drawGuide(center.y - node.height / 2f, isVertical = false, isCenter = false, width, dashEffect)
+        drawGuide(center.y, isVertical = false, isCenter = true, width, dashEffect)
+        drawGuide(center.y + node.height / 2f, isVertical = false, isCenter = false, width, dashEffect)
 
         drawRect(
             color = guideColor,
             topLeft = Offset(center.x - node.width / 2f, center.y - node.height / 2f),
             size = node,
-            style = Stroke(width = width, pathEffect = dash)
+            style = Stroke(width = width, pathEffect = dashEffect)
         )
     }
+}
+
+/// What the alignment guides for one actionable are drawn from.
+///
+/// Plain fields, not snapshot state: [coordinates] is reassigned on every layout
+/// pass and the rest on every gesture, and none of it is read from composition.
+/// Backing any of it with `mutableStateOf` would put a write into the layout
+/// phase that invalidates whoever reads it, which is the shape of a drag that
+/// re-lays out the tree on every pointer event.
+private class InertiaNodeMeasurement {
+    var coordinates: LayoutCoordinates? = null
+    var baseCenter: Offset = Offset.Zero
+        private set
+    var size: Size = Size.Zero
+        private set
+
+    /// Takes the node's laid-out center in [container]'s space and the size the
+    /// guides box in. Called once when a drag starts rather than on every layout:
+    /// the values it reads only change when layout does, and `positionInRoot`
+    /// walks the tree to the root every time it is asked.
+    ///
+    /// The modifier this measures from sits outside both the drag offset and the
+    /// animation layer, so what lands here is where layout put the node — which
+    /// is what the drag offset is added to — rather than where it is drawn.
+    fun measure(container: LayoutCoordinates?) {
+        val coordinates = coordinates ?: return
+        if (container == null || !coordinates.isAttached || !container.isAttached) return
+
+        val origin = coordinates.positionInRoot() - container.positionInRoot()
+        size = coordinates.size.toSize()
+        baseCenter = Offset(origin.x + size.width / 2f, origin.y + size.height / 2f)
+    }
+}
+
+/// One guide line spanning the container, solid through the node's center and
+/// dashed along its edges.
+private fun DrawScope.drawGuide(
+    at: Float,
+    isVertical: Boolean,
+    isCenter: Boolean,
+    width: Float,
+    dash: PathEffect
+) {
+    drawLine(
+        color = guideColor,
+        start = if (isVertical) Offset(at, 0f) else Offset(0f, at),
+        end = if (isVertical) Offset(at, size.height) else Offset(size.width, at),
+        strokeWidth = width,
+        alpha = if (isCenter) 1f else 0.5f,
+        pathEffect = if (isCenter) null else dash
+    )
 }
 
 // ========== COMPOSITION LOCALS ==========
@@ -1404,10 +1533,12 @@ fun InertiaContainer(
             LocalInertiaIsContainer provides true
         ) { content() }
 
-        if (guides.showGrid) {
-            // `matchParentSize` rather than `fillMaxSize`: the container wraps its
-            // content, and an overlay that took part in that measurement would
-            // grow it to the whole screen.
+        if (showAlignmentGrid) {
+            // Composed whether or not a drag is in progress — it draws nothing
+            // when there is none — so the container's composition never depends
+            // on the overlay's state. `matchParentSize` rather than
+            // `fillMaxSize`: the container wraps its content, and an overlay that
+            // took part in that measurement would grow it to the whole screen.
             InertiaAlignmentGrid(guides, Modifier.matchParentSize())
         }
     }
@@ -1444,13 +1575,12 @@ fun Inertiaable(
     var hierarchyId by remember { mutableStateOf<String?>(null) }
     var isSelected by remember { mutableStateOf(false) }
     var dragOffset by remember { mutableStateOf(Offset.Zero) }
+    /// This node's laid-out size. The shapes behind it are measured in multiples
+    /// of it, and nothing else about where it sits matters to them — the canvas
+    /// is a child of this node, so it travels with it.
+    var layoutSize by remember { mutableStateOf(IntSize.Zero) }
 
-    /// This node's laid-out center in the container's coordinate space, before any
-    /// drag offset, and the size the guides box in. Measured outermost in the
-    /// modifier chain — outside both the drag offset and the animation layer — so
-    /// it stays the layout position rather than the drawn one.
-    val baseCenter = remember { mutableStateOf(Offset.Zero) }
-    val nodeSize = remember { mutableStateOf(Size.Zero) }
+    val measurement = remember { InertiaNodeMeasurement() }
 
     LaunchedEffect(hierarchyIdPrefix) {
         val next = (indexMap[hierarchyIdPrefix] ?: 0)
@@ -1484,6 +1614,11 @@ fun Inertiaable(
 
         animId?.let { model.inertiaSchemas[it] } ?: model.inertiaSchemas[hierarchyIdPrefix]
     }
+
+    /// The shapes authored against this actionable, if it has any. Read off the
+    /// schema rather than the running animation, so the backdrop is there
+    /// whether or not the animation is playing.
+    val shapes = animation?.shapes ?: emptyList()
 
     // An animation starts as soon as the runtime holds its schema, or waits for
     // the app, depending on its `invokeType` — which is why this waits on the
@@ -1544,6 +1679,19 @@ fun Inertiaable(
                     rotationZ = v.rotateCenter
                     alpha = v.opacity
                     transformOrigin = TransformOrigin.Center
+                    // An alpha below 1 is composited by drawing the layer into
+                    // an offscreen buffer and then fading the buffer — and that
+                    // buffer is the size of the node, so everything the
+                    // animation draws outside its own box is thrown away. A
+                    // scaled, rotated card came out cut off at the edges of the
+                    // box it started in, which looked like clipping and was.
+                    //
+                    // Modulating alpha applies it to each drawing instruction
+                    // instead, with no buffer and so no bounds to fall outside
+                    // of. What that gives up is self-overlap: where the content
+                    // covers itself, the overlap now shows through at partial
+                    // opacity rather than fading as one flat image.
+                    compositingStrategy = CompositingStrategy.ModulateAlpha
                 }
                 .graphicsLayer {
                     rotationZ = sample().rotate
@@ -1567,6 +1715,17 @@ fun Inertiaable(
                 var totalDrag = Offset.Zero
                 var hasDragged = false
 
+                // Where this node sits before the gesture moves it, taken once
+                // here so the guides can be positioned without measuring anything
+                // per pointer event.
+                if (showAlignmentGrid) measurement.measure(guides?.containerCoordinates)
+
+                // Where the node sat before this gesture began. `totalDrag` is
+                // measured from this gesture's own down, so without carrying what
+                // came before it every drag after the first snaps back to the
+                // node's layout position.
+                val startOffset = dragOffset
+
                 // Wait for either drag or up
                 do {
                     val event = awaitPointerEvent()
@@ -1582,11 +1741,27 @@ fun Inertiaable(
 
                             // Only drag if selected
                             if (isSelected) {
-                                dragOffset += dragChange
-                                guides?.show(
-                                    center = baseCenter.value + dragOffset,
-                                    size = nodeSize.value
-                                )
+                                // Everything since the finger went down, not just
+                                // the events since the threshold was crossed:
+                                // adding up only the latter leaves the threshold
+                                // subtracted from the drag, and the node trailing
+                                // the pointer by it for the rest of the gesture.
+                                dragOffset = startOffset + totalDrag
+                                if (showAlignmentGrid) {
+                                    guides?.show(
+                                        // Whole pixels, because that is where
+                                        // `Modifier.offset` puts the node. Guides
+                                        // at the fractional position sit up to a
+                                        // pixel off it, and re-antialias along
+                                        // their whole length on every event
+                                        // rather than moving.
+                                        center = measurement.baseCenter + Offset(
+                                            dragOffset.x.toInt().toFloat(),
+                                            dragOffset.y.toInt().toFloat()
+                                        ),
+                                        size = measurement.size
+                                    )
+                                }
                                 dragEvent.consume()
                             }
                         }
@@ -1594,7 +1769,7 @@ fun Inertiaable(
                 } while (event.changes.any { it.pressed })
 
                 // On release
-                guides?.hide()
+                if (showAlignmentGrid) guides?.hide()
 
                 if (hasDragged && isSelected && canvasSize != IntSize.Zero) {
                     // Send drag translation
@@ -1644,36 +1819,40 @@ fun Inertiaable(
 
     Box(
         modifier = Modifier
-            // Ahead of the animation layer and the drag offset, so what lands here
-            // is where layout put this node, which is what `dragOffset` is added
-            // to. Anything measured after them reports the *drawn* position and
-            // the guides would chase themselves.
-            .onGloballyPositioned { coordinates ->
-                val container = guides.containerCoordinates ?: return@onGloballyPositioned
-                val origin = coordinates.positionInRoot() - container.positionInRoot()
-                val bounds = coordinates.size.toSize()
-                nodeSize.value = bounds
-                baseCenter.value = Offset(
-                    x = origin.x + bounds.width / 2f,
-                    y = origin.y + bounds.height / 2f
-                )
-            }
+            // Ahead of the animation layer and the drag offset, so these are the
+            // coordinates of where layout put this node — which is what
+            // `dragOffset` is added to. Taken after either of them, they report
+            // the *drawn* position and the guides would chase themselves.
+            .onGloballyPositioned { measurement.coordinates = it }
+            // The size the shapes behind this node are measured against. Taken
+            // here, ahead of the animation layer, for the same reason as the
+            // measurement above: read through a rotation, a node's box is the
+            // bounding box of the rotated view, which swells and shrinks as the
+            // angle turns and would have the shapes pulse in step with the spin.
+            .onSizeChanged { layoutSize = it }
             .then(modifierWithAnim)
-            .then(
-                if (isSelected && model?.isActionable == true && dragOffset != Offset.Zero) {
-                    Modifier.offset {
-                        androidx.compose.ui.unit.IntOffset(
-                            dragOffset.x.toInt(),
-                            dragOffset.y.toInt()
-                        )
-                    }
+            // Applied whether or not there is a drag in progress, and reading
+            // `dragOffset` inside the lambda rather than out here: read during
+            // composition, every pointer event of a drag would recompose this
+            // actionable and everything it wraps. Deferred to placement, a drag
+            // moves the node without recomposing anything.
+            .offset {
+                if (isSelected && model?.isActionable == true) {
+                    IntOffset(dragOffset.x.toInt(), dragOffset.y.toInt())
                 } else {
-                    Modifier
+                    IntOffset.Zero
                 }
-            )
+            }
             .then(modifierSelectedBorder(isSelected && (model?.isActionable == true)))
             .then(interactionModifier)
     ) {
+        // First in the box, so it draws behind the content it backs. Inside the
+        // animation layer and the drag offset above, so both carry the shapes
+        // along with the node rather than leaving them behind.
+        if (shapes.isNotEmpty() && layoutSize != IntSize.Zero) {
+            InertiaShapeCanvas(shapes = shapes, actionableSize = layoutSize)
+        }
+
         CompositionLocalProvider(
             LocalInertiaParentId provides hierarchyId
         ) {
