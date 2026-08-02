@@ -92,9 +92,30 @@ object InertiaLog {
 @Serializable
 data class InertiaCanvasSize(val width: Int, val height: Int)
 
+/// Every kind of message that crosses the editor channel.
+///
+/// The full set, matching `InertiaMessage.MessageType` in the Swift runtime and
+/// `MessageType` in `inertia-base`. This used to name only the three the editor
+/// sends *to* this runtime, so the four it sends back — and `signal`, which it
+/// receives — were spelled as bare string literals at each of the nine places
+/// they appear, where a typo would have compiled and gone out on the wire.
+///
+/// The name is the wire form: `MessageType.playbackProgress.name` is exactly the
+/// `"playbackProgress"` the editor reads.
 @Serializable
-enum class MessageType { actionable, actionables, schema }
+enum class MessageType {
+    actionable,
+    actionables,
+    translationEnded,
+    schema,
+    selectedNodeProperties,
+    signal,
+    playbackProgress
+}
 
+/// Read back from the wire as the string it is, rather than as [MessageType], so
+/// a message this runtime has no case for is ignored rather than failing the
+/// whole frame's decode.
 @Serializable
 data class MessageWrapper(
     val type: String,
@@ -310,19 +331,22 @@ class Tree(val id: String) {
 // ========== WEBSOCKET MESSAGES ==========
 
 @Serializable
-data class MessageActionableWrapper(val type: String, val payload: MessageActionable)
+data class MessageActionableWrapper(val type: MessageType, val payload: MessageActionable)
 
 @Serializable
-data class MessageActionablesWrapper(val type: String, val payload: MessageActionables)
+data class MessageActionablesWrapper(val type: MessageType, val payload: MessageActionables)
 
 @Serializable
-data class MessageSchemaWrapper(val type: String, val payload: MessageSchema)
+data class MessageSchemaWrapper(val type: MessageType, val payload: MessageSchema)
 
 @Serializable
-data class MessageTranslationWrapper(val type: String, val payload: MessageTranslation)
+data class MessageTranslationWrapper(val type: MessageType, val payload: MessageTranslation)
 
 @Serializable
-data class MessagePlaybackProgressWrapper(val type: String, val payload: MessagePlaybackProgress)
+data class MessagePlaybackProgressWrapper(val type: MessageType, val payload: MessagePlaybackProgress)
+
+@Serializable
+data class MessageSelectedNodePropertiesWrapper(val type: MessageType, val payload: MessageSelectedNodeProperties)
 
 /// Where the run currently on screen has got to, reported while it animates so
 /// the editor's playhead can follow it.
@@ -410,6 +434,26 @@ data class MessageTranslation(
     val translationX: Float,
     val translationY: Float,
     val actionableIds: Set<ActionableIdPair>
+)
+
+/// Where the node being dragged is, for the editor's inspector readout, sent
+/// continuously while the drag is in progress.
+///
+/// Distinct from [MessageTranslation], which is sent once when the drag ends and
+/// is what the editor authors into the schema. This one is only ever displayed,
+/// so it is safe to send at pointer rate and safe to miss.
+///
+/// [positionX] and [positionY] are the accumulated drag — how far the node has
+/// been moved from where layout put it, in pixels — matching the SwiftUI
+/// runtime's `totalOffset`. (The React runtime sends the node's absolute
+/// top-left in the container's space here instead; the two disagree, and the
+/// editor only prints whichever it is given.)
+@Serializable
+data class MessageSelectedNodeProperties(
+    val positionX: Float,
+    val positionY: Float,
+    val sizeX: Float,
+    val sizeY: Float
 )
 
 /// How every schema is decoded, whether it arrived over the socket or came out
@@ -558,19 +602,34 @@ class WebSocketClient private constructor() : WebSocketListener() {
         }
     }
 
-    fun sendMessageActionables(type: String, message: MessageActionables) {
+    fun sendMessageActionables(type: MessageType, message: MessageActionables) {
         val wrapper = MessageActionablesWrapper(type, message)
         sendJson(wrapper)
     }
 
-    fun sendMessageSchema(type: String, message: MessageSchema) {
+    fun sendMessageSchema(type: MessageType, message: MessageSchema) {
         val wrapper = MessageSchemaWrapper(type, message)
         sendJson(wrapper)
     }
 
     fun sendMessageTranslation(message: MessageTranslation) {
-        val wrapper = MessageTranslationWrapper("translationEnded", message)
+        val wrapper = MessageTranslationWrapper(MessageType.translationEnded, message)
         sendJson(wrapper)
+    }
+
+    /// The inspector readout, sent on every pointer event of a drag.
+    ///
+    /// Dropped rather than queued while the socket still has bytes to drain, for
+    /// the same reason [sendMessagePlaybackProgress] is: a stall anywhere
+    /// downstream would let a fast drag pile sends up and then burst. Nothing
+    /// depends on any single one arriving — the next event produces another, and
+    /// what the editor authors into the schema is [sendMessageTranslation] at
+    /// the end of the gesture.
+    fun sendMessageSelectedNodeProperties(message: MessageSelectedNodeProperties) {
+        if (!isConnected) return
+        if ((socket?.queueSize() ?: 0L) > 0L) return
+
+        sendJson(MessageSelectedNodePropertiesWrapper(MessageType.selectedNodeProperties, message))
     }
 
     /// The playhead moves every frame, and a stall anywhere downstream would let
@@ -585,19 +644,23 @@ class WebSocketClient private constructor() : WebSocketListener() {
         if (!isConnected) return
         if (message.isRunning && (socket?.queueSize() ?: 0L) > 0L) return
 
-        sendJson(MessagePlaybackProgressWrapper("playbackProgress", message))
+        sendJson(MessagePlaybackProgressWrapper(MessageType.playbackProgress, message))
     }
 
     private fun sendJson(wrapper: Any) {
         if (!isConnected || socket == null) return
         try {
-            // Serialize inner payload to JSON string
-            val payloadJson = when (wrapper) {
-                is MessageActionableWrapper -> json.encodeToString(wrapper.payload)
-                is MessageActionablesWrapper -> json.encodeToString(wrapper.payload)
-                is MessageSchemaWrapper -> json.encodeToString(wrapper.payload)
-                is MessageTranslationWrapper -> json.encodeToString(wrapper.payload)
-                is MessagePlaybackProgressWrapper -> json.encodeToString(wrapper.payload)
+            // Serialize inner payload to JSON string, and take the type off the
+            // wrapper rather than deriving it from the wrapper's class a second
+            // time: the two used to be separate `when`s over the same five
+            // classes, which is one place for them to disagree.
+            val (type, payloadJson) = when (wrapper) {
+                is MessageActionableWrapper -> wrapper.type to json.encodeToString(wrapper.payload)
+                is MessageActionablesWrapper -> wrapper.type to json.encodeToString(wrapper.payload)
+                is MessageSchemaWrapper -> wrapper.type to json.encodeToString(wrapper.payload)
+                is MessageTranslationWrapper -> wrapper.type to json.encodeToString(wrapper.payload)
+                is MessagePlaybackProgressWrapper -> wrapper.type to json.encodeToString(wrapper.payload)
+                is MessageSelectedNodePropertiesWrapper -> wrapper.type to json.encodeToString(wrapper.payload)
                 else -> return
             }
 
@@ -605,16 +668,7 @@ class WebSocketClient private constructor() : WebSocketListener() {
             val payloadBase64 = Base64.getEncoder().encodeToString(payloadJson.toByteArray(StandardCharsets.UTF_8))
 
             // Wrap with type + Base64 payload
-            val type = when (wrapper) {
-                is MessageActionableWrapper -> "actionable"
-                is MessageActionablesWrapper -> "actionables"
-                is MessageSchemaWrapper -> "schema"
-                is MessageTranslationWrapper -> "translationEnded"
-                is MessagePlaybackProgressWrapper -> "playbackProgress"
-                else -> return
-            }
-
-            val wrapperObj = MessageWrapper(type, payloadBase64)
+            val wrapperObj = MessageWrapper(type.name, payloadBase64)
             val wrapperJson = json.encodeToString(wrapperObj)
 
             // Send as text WebSocket frame
@@ -647,21 +701,23 @@ class WebSocketClient private constructor() : WebSocketListener() {
             val payloadBytes = Base64.getDecoder().decode(wrapper.payload)
             val payloadJson = String(payloadBytes, StandardCharsets.UTF_8)
 
-            // Deserialize based on type
-            when (wrapper.type) {
-                "actionable" -> {
+            // Deserialize based on type. A type this runtime has no case for —
+            // one of its own reports echoed back, or something a newer editor
+            // sends — resolves to null and falls through the `when`.
+            when (MessageType.entries.firstOrNull { it.name == wrapper.type }) {
+                MessageType.actionable -> {
                     val decoded = json.decodeFromString<MessageActionable>(payloadJson)
                     scope.launch { _onIsActionable.emit(decoded.isActionable) }
                 }
-                "actionables" -> {
+                MessageType.actionables -> {
                     val decoded = json.decodeFromString<MessageActionables>(payloadJson)
                     scope.launch { _onSelectedIds.emit(decoded.actionableIds) }
                 }
-                "schema" -> {
+                MessageType.schema -> {
                     val decoded = json.decodeFromString<MessageSchema>(payloadJson)
                     scope.launch { _onSchema.emit(decoded.schemaWrappers) }
                 }
-                "signal" -> {
+                MessageType.signal -> {
                     // Decoded by hand: the signal is a Swift enum with associated
                     // values, whose synthesized encoding has no fixed key set.
                     val obj = json.parseToJsonElement(payloadJson).jsonObject
@@ -669,6 +725,12 @@ class WebSocketClient private constructor() : WebSocketListener() {
                     val sequence = obj["sequence"]?.jsonPrimitive?.intOrNull ?: 0
                     scope.launch { _onSignal.emit(signal to sequence) }
                 }
+                // The four this runtime only ever sends — plus null, an
+                // unrecognized type — are not errors to receive.
+                MessageType.translationEnded,
+                MessageType.selectedNodeProperties,
+                MessageType.playbackProgress,
+                null -> Unit
             }
 
         }.onFailure { it.printStackTrace() }
@@ -1584,7 +1646,7 @@ fun InertiaContainer(
                 tree = model.tree.toDTO(),
                 actionableIds = model.actionableIds.toSet()
             )
-            ws.sendMessageActionables("actionables", msg)
+            ws.sendMessageActionables(MessageType.actionables, msg)
         }
 
         launch {
@@ -1879,9 +1941,12 @@ fun Inertia(
                 var hasDragged = false
 
                 // Where this node sits before the gesture moves it, taken once
-                // here so the guides can be positioned without measuring anything
-                // per pointer event.
-                if (showAlignmentGrid) measurement.measure(guides?.containerCoordinates)
+                // here so the guides can be positioned — and the inspector
+                // readout sized — without measuring anything per pointer event.
+                // Unconditional: the size it takes is what
+                // `MessageSelectedNodeProperties` reports, which happens whether
+                // or not the guides are being drawn.
+                measurement.measure(guides?.containerCoordinates)
 
                 // Where the node sat before this gesture began. `totalDrag` is
                 // measured from this gesture's own down, so without carrying what
@@ -1925,6 +1990,20 @@ fun Inertia(
                                         size = measurement.size
                                     )
                                 }
+
+                                // The editor's inspector, which was blank on
+                                // Android until this: the SwiftUI runtime sends
+                                // this on every drag change and the React one on
+                                // every move, and this runtime had neither the
+                                // message nor a way to send it.
+                                WebSocketClient.shared.sendMessageSelectedNodeProperties(
+                                    MessageSelectedNodeProperties(
+                                        positionX = dragOffset.x,
+                                        positionY = dragOffset.y,
+                                        sizeX = measurement.size.width,
+                                        sizeY = measurement.size.height
+                                    )
+                                )
                                 dragEvent.consume()
                             }
                         }
@@ -1966,7 +2045,7 @@ fun Inertia(
                         }
 
                         // Send updated selection to WebSocket
-                        WebSocketClient.shared.sendMessageActionables("actionables",
+                        WebSocketClient.shared.sendMessageActionables(MessageType.actionables,
                             MessageActionables(
                                 tree = m.tree.toDTO(),
                                 actionableIds = newActionableIds.toSet()
