@@ -33,6 +33,7 @@ import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.layout.positionInRoot
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
@@ -411,12 +412,17 @@ data class MessageTranslation(
     val actionableIds: Set<ActionableIdPair>
 )
 
+/// How every schema is decoded, whether it arrived over the socket or came out
+/// of the shipped animation file. Shared so the two paths cannot drift: a field
+/// the editor adds must be ignorable by both.
+internal val inertiaJson = Json { ignoreUnknownKeys = true; encodeDefaults = true }
+
 // ========== WEBSOCKET CLIENT ==========
 
 class WebSocketClient private constructor() : WebSocketListener() {
     companion object {
         val shared: WebSocketClient by lazy { WebSocketClient() }
-        private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
+        private val json = inertiaJson
 
         /// How long to wait before dialing the editor again, backing off from the
         /// first to the second. The editor is usually not up yet when the app
@@ -712,7 +718,7 @@ class WebSocketClient private constructor() : WebSocketListener() {
 
 // ========== TRACKS ==========
 
-object InertiaPlaybackDefaults {
+object InertiaPlayback {
     /// How long one loop lasts until the editor says otherwise.
     ///
     /// A loop lasts as long as the timeline the animation was authored on, not
@@ -726,12 +732,12 @@ object InertiaPlaybackDefaults {
     /// The range the timeline can be resized to. Shorter than this cannot hold a
     /// keyframe apart from its neighbours; longer is past the point of seeing
     /// the whole thing at once.
-    const val minLoopDuration: Float = 0.1f
-    const val maxLoopDuration: Float = 60.0f
+    val loopDurationRange: ClosedFloatingPointRange<Float> = 0.1f..60.0f
 
+    /// Brings a loop length the user typed, or a peer sent, into range.
     fun clampLoopDuration(seconds: Float): Float {
         if (!seconds.isFinite()) return defaultLoopDuration
-        return seconds.coerceIn(minLoopDuration, maxLoopDuration)
+        return seconds.coerceIn(loopDurationRange)
     }
 }
 
@@ -968,12 +974,12 @@ internal fun InertiaAnimationSchema.valuesAtTime(
 /// samples the values its track reaches at the playhead. Playing, pausing and
 /// scrubbing are then all the same operation.
 ///
-/// Reached through [LocalInertia], and keyed by the `hierarchyIdPrefix` the app
-/// hands to [Inertiaable] rather than the per-instance hierarchy id the runtime
-/// derives from it — the prefix is the id an animation is authored against, so
-/// starting one starts every actionable sharing it.
+/// Reached through [LocalInertia], and keyed by the `id` the app hands to
+/// [Inertia] rather than the per-instance hierarchy id the runtime derives from
+/// it — that id is the one an animation is authored against, so starting one
+/// starts every actionable sharing it.
 @Stable
-class InertiaPlayback internal constructor() {
+class InertiaPlaybackController internal constructor() {
 
     /// What the app has asked of each prefix. An absent entry is an animation
     /// nothing has started yet, which is what lets `auto` tell a run it has
@@ -995,8 +1001,7 @@ class InertiaPlayback internal constructor() {
     /// How long one loop lasts, as set on the editor's timeline. Read each frame,
     /// so resizing the timeline mid-run stretches the loop rather than waiting
     /// for it to be restarted.
-    var loopDuration: Float by mutableFloatStateOf(InertiaPlaybackDefaults.defaultLoopDuration)
-        private set
+    var loopDuration: Float by mutableFloatStateOf(InertiaPlayback.defaultLoopDuration)
 
     /// How far into the run currently on screen we are, in seconds.
     var playheadTime: Float by mutableFloatStateOf(0f)
@@ -1005,7 +1010,7 @@ class InertiaPlayback internal constructor() {
     /// Whether a run is on screen: playing, or holding the frame it finished on.
     /// Not the same as the clock ticking — a run that has played once and stopped
     /// still holds its final values.
-    var isRunning: Boolean by mutableStateOf(false)
+    internal var isRunning: Boolean by mutableStateOf(false)
         private set
 
     /// Whether the clock is advancing. What the container's frame loop follows.
@@ -1046,7 +1051,7 @@ class InertiaPlayback internal constructor() {
     /// One turn of the timeline: the loop the editor drew, or the longest track,
     /// whichever is longer. Anything recorded past the end of the loop stretches
     /// it, which keeps every track the same length as every other.
-    val playbackDuration: Float
+    internal val playbackDuration: Float
         get() = maxOf(loopDuration, schemas.values.maxOfOrNull { it.trackDuration() } ?: 0f)
 
     // MARK: - App-facing controls
@@ -1057,11 +1062,11 @@ class InertiaPlayback internal constructor() {
     /// progress rather than cutting it short — [restart] is the one that starts
     /// over. Cancelled animations are left where they are: stopping one is the
     /// app's call, and picking it back up is [restart]'s.
-    fun trigger(hierarchyIdPrefix: String) {
-        val state = states[hierarchyIdPrefix]
+    fun trigger(id: String) {
+        val state = states[id]
         if (state?.isCancelled == true || state?.trigger == true) return
 
-        markTriggered(hierarchyIdPrefix)
+        markTriggered(id)
         seekTime = null
         startClock()
     }
@@ -1071,9 +1076,9 @@ class InertiaPlayback internal constructor() {
     ///
     /// The clock stops with the last animation running off it, since a playhead
     /// with nothing left to follow is one the editor should see parked.
-    fun cancel(hierarchyIdPrefix: String) {
-        states[hierarchyIdPrefix] = InertiaAnimationState(
-            id = hierarchyIdPrefix,
+    fun cancel(id: String) {
+        states[id] = InertiaAnimationState(
+            id = id,
             trigger = false,
             isCancelled = true
         )
@@ -1090,8 +1095,8 @@ class InertiaPlayback internal constructor() {
     /// rewinds the playhead for all of them rather than for this animation alone
     /// — the same shared clock that makes a trigger mid-run join the run in
     /// progress instead of restarting it.
-    fun restart(hierarchyIdPrefix: String) {
-        markTriggered(hierarchyIdPrefix)
+    fun restart(id: String) {
+        markTriggered(id)
 
         stopClock()
         playheadTime = 0f
@@ -1099,8 +1104,8 @@ class InertiaPlayback internal constructor() {
         startClock()
     }
 
-    fun isCancelled(hierarchyIdPrefix: String): Boolean =
-        states[hierarchyIdPrefix]?.isCancelled == true
+    fun isCancelled(id: String): Boolean =
+        states[id]?.isCancelled == true
 
     // MARK: - Registration
 
@@ -1157,7 +1162,7 @@ class InertiaPlayback internal constructor() {
             AnimationSignal.Resume -> resumePlayback()
             is AnimationSignal.Seek -> seek(signal.time)
             is AnimationSignal.SetLoopDuration -> {
-                loopDuration = InertiaPlaybackDefaults.clampLoopDuration(signal.duration)
+                loopDuration = InertiaPlayback.clampLoopDuration(signal.duration)
             }
         }
     }
@@ -1463,7 +1468,7 @@ private fun DrawScope.drawGuide(
 // ========== COMPOSITION LOCALS ==========
 
 /// Playback for the enclosing [InertiaContainer].
-val LocalInertia = staticCompositionLocalOf<InertiaPlayback> {
+val LocalInertia = staticCompositionLocalOf<InertiaPlaybackController> {
     error("LocalInertia was read outside of an InertiaContainer.")
 }
 
@@ -1498,9 +1503,10 @@ object SharedIndexManager {
 /// is not something the editor can know while the animation is being authored.
 @Composable
 fun InertiaContainer(
+    dev: Boolean,
     id: String,
+    hierarchyId: String,
     baseURL: String,
-    dev: Boolean = false,
     content: @Composable () -> Unit
 ) {
     var model by remember {
@@ -1522,10 +1528,48 @@ fun InertiaContainer(
 
     var size by remember { mutableStateOf(IntSize.Zero) }
 
-    val playback = remember { InertiaPlayback() }
+    val playback = remember { InertiaPlaybackController() }
     val guides = remember { InertiaGuideState() }
 
-    LaunchedEffect(model.tree, baseURL) {
+    val context = LocalContext.current
+
+    /// Outside the editor the schemas come from the shipped animation file
+    /// rather than the socket, the way the SwiftUI runtime reads `<id>.json`
+    /// from its bundle and the React runtime fetches it from `baseURL`. A
+    /// missing or unreadable file leaves the actionables at their layout
+    /// positions rather than bringing the app down — a broken animation is not
+    /// worth a crash.
+    LaunchedEffect(dev, id) {
+        if (dev) return@LaunchedEffect
+
+        val schemas = try {
+            val text = context.assets.open("$id.json")
+                .bufferedReader(StandardCharsets.UTF_8)
+                .use { it.readText() }
+            inertiaJson.decodeFromString<List<InertiaAnimationSchema>>(text)
+        } catch (error: Exception) {
+            InertiaLog.error("failed to load $id.json: $error")
+            return@LaunchedEffect
+        }
+
+        InertiaLog.debug("loaded ${schemas.size} schema(s) from $id.json")
+
+        // Keyed by the id they were authored against, which is the `id` an
+        // actionable hands to [Inertia]: there are no per-instance ids on disk.
+        model = model.copyMutable {
+            schemas.forEach { schema ->
+                inertiaSchemas[schema.id] = schema
+                actionableIdToAnimationIdMap[schema.id] = schema.id
+            }
+        }
+    }
+
+    LaunchedEffect(dev, model.tree, baseURL) {
+        // Nothing but the editor is on the other end of this socket, so a
+        // shipped build does not open one. The SwiftUI runtime gates its
+        // channel on `dev` and the React runtime returns before connecting.
+        if (!dev) return@LaunchedEffect
+
         val ws = WebSocketClient.shared
 
         // The URL the app passed, as passed. This used to rewrite `127.0.0.1` to
@@ -1624,8 +1668,8 @@ fun InertiaContainer(
             LocalInertiaDataModel provides model,
             LocalUpdateModel provides updateModel,
             LocalInertiaGuides provides guides,
-            LocalInertiaParentId provides id,
-            LocalInertiaContainerId provides id,
+            LocalInertiaParentId provides hierarchyId,
+            LocalInertiaContainerId provides hierarchyId,
             LocalInertiaIsContainer provides true
         ) { content() }
 
@@ -1656,8 +1700,8 @@ private inline fun InertiaDataModel.copyMutable(block: InertiaDataModel.() -> Un
 }
 
 @Composable
-fun Inertiaable(
-    hierarchyIdPrefix: String,
+fun Inertia(
+    id: String,
     content: @Composable () -> Unit
 ) {
     val model = LocalInertiaDataModel.current
@@ -1668,8 +1712,14 @@ fun Inertiaable(
     val isContainer = LocalInertiaIsContainer.current
     val canvasSize = LocalCanvasSize.current
 
+    /// The id the app authored against, which every instance of this actionable
+    /// shares. What playback is keyed by, and what a schema loaded from a project
+    /// file is named after.
+    val hierarchyIdPrefix = id
+
     val indexMap = SharedIndexManager.indexMap
-    var hierarchyId by remember { mutableStateOf<String?>(null) }
+    /// This instance's own id: the prefix plus its index among its siblings.
+    var instanceId by remember { mutableStateOf<String?>(null) }
     var isSelected by remember { mutableStateOf(false) }
     var dragOffset by remember { mutableStateOf(Offset.Zero) }
     /// This node's laid-out size. The shapes behind it are measured in multiples
@@ -1682,17 +1732,17 @@ fun Inertiaable(
     LaunchedEffect(hierarchyIdPrefix) {
         val next = (indexMap[hierarchyIdPrefix] ?: 0)
         indexMap[hierarchyIdPrefix] = next + 1
-        hierarchyId = "$hierarchyIdPrefix--$next"
+        instanceId = "$hierarchyIdPrefix--$next"
     }
 
-    LaunchedEffect(hierarchyId) {
-        val id = hierarchyId ?: return@LaunchedEffect
-        model?.tree?.addRelationship(id, parentId, isContainer)
+    LaunchedEffect(instanceId) {
+        val instance = instanceId ?: return@LaunchedEffect
+        model?.tree?.addRelationship(instance, parentId, isContainer)
     }
 
-    LaunchedEffect(hierarchyId, model?.actionableIds) {
-        hierarchyId?.let { id ->
-            isSelected = model?.actionableIds?.any { it.hierarchyId == id } == true
+    LaunchedEffect(instanceId, model?.actionableIds) {
+        instanceId?.let { instance ->
+            isSelected = model?.actionableIds?.any { it.hierarchyId == instance } == true
         }
     }
 
@@ -1704,10 +1754,10 @@ fun Inertiaable(
     // project file are keyed by the prefix instead — there are no instances on
     // disk — so a miss falls back to the prefix rather than leaving the
     // actionable unanimated.
-    val animation = remember(model, hierarchyId) {
-        val id = hierarchyId ?: return@remember null
+    val animation = remember(model, instanceId) {
+        val instance = instanceId ?: return@remember null
         val map = model?.actionableIdToAnimationIdMap ?: return@remember null
-        val animId = map[id] ?: map[hierarchyIdPrefix]
+        val animId = map[instance] ?: map[hierarchyIdPrefix]
 
         animId?.let { model.inertiaSchemas[it] } ?: model.inertiaSchemas[hierarchyIdPrefix]
     }
@@ -1740,7 +1790,7 @@ fun Inertiaable(
         val invokeType = animation?.invokeType
         if (invokeType == null) {
             InertiaLog.debug(
-                "no animation for hierarchyId=$hierarchyId prefix=$hierarchyIdPrefix — " +
+                "no animation for instanceId=$instanceId hierarchyId=$hierarchyIdPrefix — " +
                     "map=${model?.actionableIdToAnimationIdMap} " +
                     "schemas=${model?.inertiaSchemas?.keys}"
             )
@@ -1898,13 +1948,13 @@ fun Inertiaable(
                     }
                 } else if (!hasDragged) {
                     // It was a tap, toggle selection
-                    val id = hierarchyId
+                    val instance = instanceId
                     val m = model
-                    if (id != null && m != null) {
+                    if (instance != null && m != null) {
                         val newActionableIds = m.actionableIds.toMutableSet()
                         val pair = ActionableIdPair(
                             hierarchyIdPrefix = hierarchyIdPrefix,
-                            hierarchyId = id
+                            hierarchyId = instance
                         )
                         if (!newActionableIds.remove(pair)) {
                             newActionableIds.add(pair)
@@ -1989,7 +2039,7 @@ fun Inertiaable(
         }
 
         CompositionLocalProvider(
-            LocalInertiaParentId provides hierarchyId
+            LocalInertiaParentId provides instanceId
         ) {
             content()
         }

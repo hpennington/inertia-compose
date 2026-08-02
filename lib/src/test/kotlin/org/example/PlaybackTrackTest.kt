@@ -142,9 +142,9 @@ class PlaybackTrackTest {
 
     @Test
     fun `loop durations are clamped into range`() {
-        assertEquals(0.1f, InertiaPlaybackDefaults.clampLoopDuration(0.01f), 0.0001f)
-        assertEquals(60f, InertiaPlaybackDefaults.clampLoopDuration(120f), 0.0001f)
-        assertEquals(3f, InertiaPlaybackDefaults.clampLoopDuration(Float.NaN), 0.0001f)
+        assertEquals(0.1f, InertiaPlayback.clampLoopDuration(0.01f), 0.0001f)
+        assertEquals(60f, InertiaPlayback.clampLoopDuration(120f), 0.0001f)
+        assertEquals(3f, InertiaPlayback.clampLoopDuration(Float.NaN), 0.0001f)
     }
 
     /// Swift synthesizes `Codable` for an enum with associated values as a
