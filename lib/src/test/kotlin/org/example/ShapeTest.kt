@@ -5,15 +5,15 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
-import kotlinx.serialization.json.Json
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.decodeFromByteArray
+import kotlinx.serialization.encodeToByteArray
 
 /// The shapes an actionable's canvas draws: how they are authored alongside an
 /// animation, and how they reach the renderer. The Swift and web runtimes carry
 /// the same cases — a shape that lands somewhere else on one platform is a
 /// shape that was authored once and drawn twice differently.
 class ShapeTest {
-
-    private val json = Json { ignoreUnknownKeys = true }
 
     /// Well inside a pixel at any sane container size, and wide enough for the
     /// error a couple of float operations can accumulate.
@@ -24,37 +24,45 @@ class ShapeTest {
         color = InertiaColor(red = 1f, green = 1f, blue = 1f, alpha = 1f)
     )
 
-    /// The two kinds of entry `example/demo.inertia/animations/animation.json`
-    /// holds: a card with a shape behind it, and one without the key at all.
-    private val demoJson = """
-    [
-      {
-        "id": "card0",
-        "initialValues": {"opacity": 1, "rotate": 0, "rotateCenter": 0, "scale": 1, "translate": [0, 0]},
-        "invokeType": "trigger",
-        "keyframes": [],
-        "shapes": [
-          {
-            "vertices": [
-              {"position": {"x": 0, "y": 0}, "color": {"red": 0.35, "green": 0.1, "blue": 0.85, "alpha": 0.6}},
-              {"position": {"x": 1, "y": 0}, "color": {"red": 0.1, "green": 0.55, "blue": 0.95, "alpha": 0.6}},
-              {"position": {"x": 1, "y": 1}, "color": {"red": 0.1, "green": 0.85, "blue": 0.75, "alpha": 0.6}},
-              {"position": {"x": 0, "y": 1}, "color": {"red": 0.35, "green": 0.1, "blue": 0.85, "alpha": 0.6}}
-            ]
-          }
-        ]
-      },
-      {
-        "id": "card1",
-        "initialValues": {"opacity": 1, "rotate": 0, "rotateCenter": 0, "scale": 1, "translate": [0, 0]},
-        "invokeType": "auto",
-        "keyframes": []
-      }
-    ]
-    """.trimIndent()
+    /// A schema as it was written before shapes existed: the key is genuinely
+    /// absent from the encoded bytes rather than present and empty, which is
+    /// what `animation without shapes still decodes` is about. Encoding the real
+    /// type would always write the field, so the case needs its own shape.
+    @Serializable
+    private data class SchemaWithoutShapes(
+        val id: String,
+        val initialValues: InertiaAnimationValues,
+        val invokeType: InertiaAnimationInvokeType,
+        val keyframes: List<InertiaAnimationKeyframe>
+    )
 
-    private fun demoSchemas(): Map<String, InertiaAnimationSchema> =
-        json.decodeFromString<List<InertiaAnimationSchema>>(demoJson).associateBy { it.id }
+    private fun shapedCorner(x: Float, y: Float, red: Float, green: Float, blue: Float) = Vertex(
+        position = InertiaPoint(x, y),
+        color = InertiaColor(red = red, green = green, blue = blue, alpha = 0.6f)
+    )
+
+    /// A card with a shape behind it, taken through the bytes rather than built
+    /// in memory: what is being checked is that a shape survives the animation
+    /// file, so decoding has to be part of it.
+    private fun demoSchemas(): Map<String, InertiaAnimationSchema> {
+        val card0 = InertiaAnimationSchema(
+            id = "card0",
+            invokeType = InertiaAnimationInvokeType.trigger,
+            shapes = listOf(
+                InertiaShape(
+                    vertices = listOf(
+                        shapedCorner(0f, 0f, 0.35f, 0.1f, 0.85f),
+                        shapedCorner(1f, 0f, 0.1f, 0.55f, 0.95f),
+                        shapedCorner(1f, 1f, 0.1f, 0.85f, 0.75f),
+                        shapedCorner(0f, 1f, 0.35f, 0.1f, 0.85f)
+                    )
+                )
+            )
+        )
+
+        val bytes = inertiaMsgPack.encodeToByteArray(listOf(card0))
+        return inertiaMsgPack.decodeFromByteArray<List<InertiaAnimationSchema>>(bytes).associateBy { it.id }
+    }
 
     @Test
     fun `shapes are decoded with their vertices`() {
@@ -71,7 +79,16 @@ class ShapeTest {
     /// container's schemas down with it.
     @Test
     fun `animation without shapes still decodes`() {
-        assertEquals(emptyList(), demoSchemas().getValue("card1").shapes)
+        val bytes = inertiaMsgPack.encodeToByteArray(
+            SchemaWithoutShapes(
+                id = "card1",
+                initialValues = InertiaAnimationValues(),
+                invokeType = InertiaAnimationInvokeType.auto,
+                keyframes = emptyList()
+            )
+        )
+
+        assertEquals(emptyList(), inertiaMsgPack.decodeFromByteArray<InertiaAnimationSchema>(bytes).shapes)
     }
 
     /// A shape is a ring of corners; the renderer draws triangles. Four corners
@@ -157,34 +174,35 @@ class ShapeTest {
     /// The other way a shape is authored: a drawn vector, described rather than
     /// spelled out corner by corner, with a track of its own attached — which is
     /// what makes it move independently of the actionable it is drawn behind.
-    private val drawnJson = """
-    [
-      {
-        "id": "card2",
-        "initialValues": {"opacity": 1, "rotate": 0, "rotateCenter": 0, "scale": 1, "translate": [0, 0]},
-        "invokeType": "auto",
-        "keyframes": [],
-        "shapes": [
-          {
-            "shape": {"id": "123", "width": 2, "height": 2, "type": "rectangle"},
-            "animation": {
-              "id": "shape0",
-              "initialValues": {"opacity": 1, "rotate": 0, "rotateCenter": 0, "scale": 1, "translate": [0, 0]},
-              "invokeType": "auto",
-              "keyframes": [
-                {"id": "a", "duration": 0.001, "values": {"opacity": 1, "rotate": 0, "rotateCenter": 0, "scale": 1, "translate": [0.8, 0.9]}},
-                {"id": "b", "duration": 1.3, "values": {"opacity": 1, "rotate": 0, "rotateCenter": 0, "scale": 1, "translate": [-0.02, -0.05]}}
-              ],
-              "shapes": []
-            }
-          }
-        ]
-      }
-    ]
-    """.trimIndent()
+    private fun drawnShape(): InertiaShape {
+        fun values(x: Float, y: Float) = InertiaAnimationValues(translate = listOf(x, y))
 
-    private fun drawnShape(): InertiaShape =
-        json.decodeFromString<List<InertiaAnimationSchema>>(drawnJson).first().shapes.first()
+        val card2 = InertiaAnimationSchema(
+            id = "card2",
+            invokeType = InertiaAnimationInvokeType.auto,
+            shapes = listOf(
+                InertiaShape(
+                    shape = InertiaShapeProperties(
+                        id = "123",
+                        type = InertiaShapeType.rectangle,
+                        width = 2f,
+                        height = 2f
+                    ),
+                    animation = InertiaAnimationSchema(
+                        id = "shape0",
+                        invokeType = InertiaAnimationInvokeType.auto,
+                        keyframes = listOf(
+                            InertiaAnimationKeyframe("a", values(0.8f, 0.9f), duration = 0.001f),
+                            InertiaAnimationKeyframe("b", values(-0.02f, -0.05f), duration = 1.3f)
+                        )
+                    )
+                )
+            )
+        )
+
+        val bytes = inertiaMsgPack.encodeToByteArray(listOf(card2))
+        return inertiaMsgPack.decodeFromByteArray<List<InertiaAnimationSchema>>(bytes).first().shapes.first()
+    }
 
     /// A shape given a track keeps it: without this the vector is decoded and
     /// drawn, and then sits still because the only animation that reached the

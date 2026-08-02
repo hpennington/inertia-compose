@@ -56,7 +56,7 @@ dependencies {
 
     // KotlinX + OkHttp
     implementation(libs.kotlinx.coroutines.core)
-    implementation(libs.kotlinx.serialization.json)
+    implementation(libs.kotlinx.serialization.msgpack)
     implementation(libs.okhttp)
 
     // Kotlin Test (replaces JUnit)

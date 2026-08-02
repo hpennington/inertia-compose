@@ -3,8 +3,7 @@ package org.inertiagraphics.inertia
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.decodeFromByteArray
 
 /// The track maths the editor's playhead depends on. Every runtime has to agree
 /// on these or the same authored animation plays at a different rate on each
@@ -148,18 +147,35 @@ class PlaybackTrackTest {
     }
 
     /// Swift synthesizes `Codable` for an enum with associated values as a
-    /// single-key object, which is the only shape signals arrive in.
+    /// single-key map, which is the only shape signals arrive in.
+    ///
+    /// These are the literal bytes `MessagePackEncoder` writes for an
+    /// `AnimationSignal`, rather than bytes this runtime produced for itself:
+    /// what matters is that the editor's encoding decodes here, and a fixture
+    /// written by the same library on both sides would never show it failing to.
+    /// `81` opens a one-entry map, `a4`/`a5` a short string, `ca` a float32, and
+    /// `80` is the empty map a case with no associated value encodes to.
     @Test
     fun `editor signals decode from Swift's synthesized encoding`() {
-        fun decode(raw: String) = decodeAnimationSignal(Json.parseToJsonElement(raw).jsonObject)
+        fun decode(hex: String) = decodeAnimationSignal(
+            inertiaMsgPack.decodeFromByteArray<AnimationSignalDTO>(hex.hexToBytes())
+        )
 
-        assertEquals(AnimationSignal.Pause, decode("""{"pause":{}}"""))
-        assertEquals(AnimationSignal.Resume, decode("""{"resume":{}}"""))
-        assertEquals(AnimationSignal.Seek(1.25f), decode("""{"seek":{"_0":1.25}}"""))
+        // {"pause": {}}
+        assertEquals(AnimationSignal.Pause, decode("81a5706175736580"))
+        // {"resume": {}}
+        assertEquals(AnimationSignal.Resume, decode("81a6726573756d6580"))
+        // {"seek": {"_0": 1.25}}
+        assertEquals(AnimationSignal.Seek(1.25f), decode("81a47365656b81a25f30ca3fa00000"))
+        // {"setLoopDuration": {"_0": 4.5}}
         assertEquals(
             AnimationSignal.SetLoopDuration(4.5f),
-            decode("""{"setLoopDuration":{"_0":4.5}}""")
+            decode("81af7365744c6f6f704475726174696f6e81a25f30ca40900000")
         )
-        assertNull(decode("""{"somethingElse":{}}"""))
+        // {"somethingElse": {}}
+        assertNull(decode("81ad736f6d657468696e67456c736580"))
     }
+
+    private fun String.hexToBytes(): ByteArray =
+        chunked(2).map { it.toInt(16).toByte() }.toByteArray()
 }

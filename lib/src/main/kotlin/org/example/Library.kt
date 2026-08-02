@@ -50,18 +50,15 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import com.ensarsarajcic.kotlinx.serialization.msgpack.MsgPack
+import com.ensarsarajcic.kotlinx.serialization.msgpack.MsgPackConfiguration
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.floatOrNull
-import kotlinx.serialization.json.intOrNull
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
-import kotlinx.serialization.encodeToString
-import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.decodeFromByteArray
+import kotlinx.serialization.encodeToByteArray
 import okhttp3.*
 import okio.ByteString
-import java.nio.charset.StandardCharsets
+import okio.ByteString.Companion.toByteString
 import java.util.*
 import java.util.concurrent.TimeUnit
 import java.util.regex.Pattern
@@ -116,11 +113,25 @@ enum class MessageType {
 /// Read back from the wire as the string it is, rather than as [MessageType], so
 /// a message this runtime has no case for is ignored rather than failing the
 /// whole frame's decode.
+///
+/// [payload] is the inner message as a *separately encoded* MessagePack
+/// document, which rides in a `bin` value — the same `Data` the Swift runtime
+/// declares. Reading the envelope therefore never needs to know what it holds.
 @Serializable
 data class MessageWrapper(
     val type: String,
-    val payload: String
-)
+    val payload: ByteArray
+) {
+    // ByteArray gets identity equality from the data class, which would make two
+    // wrappers holding the same bytes unequal.
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is MessageWrapper) return false
+        return type == other.type && payload.contentEquals(other.payload)
+    }
+
+    override fun hashCode(): Int = 31 * type.hashCode() + payload.contentHashCode()
+}
 
 @Serializable
 data class InertiaAnimationValues(
@@ -376,21 +387,40 @@ sealed interface AnimationSignal {
     data class SetLoopDuration(val duration: Float) : AnimationSignal
 }
 
+/// One case of a Swift enum as it arrives: the associated value under `_0`, or
+/// nothing at all for a case that carries none.
+@Serializable
+data class AnimationSignalCaseDTO(
+    @SerialName("_0") val value: Float = 0f
+)
+
 /// Swift synthesizes `Codable` for an enum with associated values as a
-/// single-key object — `{"seek": {"_0": 1.25}}` — which is what this unpacks.
-/// The editor is the only sender, so this is the only shape signals arrive in.
-internal fun decodeAnimationSignal(raw: JsonObject?): AnimationSignal? {
+/// single-key map — `{"seek": {"_0": 1.25}}`, and `{"pause": {}}` for a case
+/// with no value. Exactly one of these is ever present; the rest decode to null
+/// from their defaults, which is how the case is identified.
+@Serializable
+data class AnimationSignalDTO(
+    val pause: AnimationSignalCaseDTO? = null,
+    val resume: AnimationSignalCaseDTO? = null,
+    val seek: AnimationSignalCaseDTO? = null,
+    val setLoopDuration: AnimationSignalCaseDTO? = null
+)
+
+@Serializable
+data class MessageSignalDTO(
+    val signal: AnimationSignalDTO,
+    val sequence: Int = 0
+)
+
+/// The editor is the only sender of signals, so the shape above is the only one
+/// they arrive in.
+internal fun decodeAnimationSignal(raw: AnimationSignalDTO?): AnimationSignal? {
     if (raw == null) return null
 
-    if (raw.containsKey("pause")) return AnimationSignal.Pause
-    if (raw.containsKey("resume")) return AnimationSignal.Resume
-
-    raw["seek"]?.jsonObject?.get("_0")?.jsonPrimitive?.floatOrNull?.let {
-        return AnimationSignal.Seek(it)
-    }
-    raw["setLoopDuration"]?.jsonObject?.get("_0")?.jsonPrimitive?.floatOrNull?.let {
-        return AnimationSignal.SetLoopDuration(it)
-    }
+    if (raw.pause != null) return AnimationSignal.Pause
+    if (raw.resume != null) return AnimationSignal.Resume
+    raw.seek?.let { return AnimationSignal.Seek(it.value) }
+    raw.setLoopDuration?.let { return AnimationSignal.SetLoopDuration(it.value) }
 
     return null
 }
@@ -459,14 +489,24 @@ data class MessageSelectedNodeProperties(
 /// How every schema is decoded, whether it arrived over the socket or came out
 /// of the shipped animation file. Shared so the two paths cannot drift: a field
 /// the editor adds must be ignorable by both.
-internal val inertiaJson = Json { ignoreUnknownKeys = true; encodeDefaults = true }
+///
+/// MessagePack rather than JSON — see `InertiaCoding` in the Swift runtime,
+/// which decides the format for all three. Two settings matter for talking to
+/// it: enums go out as their names rather than their ordinals (the default, and
+/// what Swift writes), and `rawCompatibility` stays off so a `ByteArray` is a
+/// `bin` value rather than a string.
+internal val inertiaMsgPack = MsgPack(MsgPackConfiguration(ignoreUnknownKeys = true))
+
+/// The extension a shipped animation file carries, matching the Swift runtime's
+/// `InertiaCoding.fileExtension`.
+internal const val INERTIA_FILE_EXTENSION = "msgpack"
 
 // ========== WEBSOCKET CLIENT ==========
 
 class WebSocketClient private constructor() : WebSocketListener() {
     companion object {
         val shared: WebSocketClient by lazy { WebSocketClient() }
-        private val json = inertiaJson
+        private val msgPack = inertiaMsgPack
 
         /// How long to wait before dialing the editor again, backing off from the
         /// first to the second. The editor is usually not up yet when the app
@@ -604,17 +644,17 @@ class WebSocketClient private constructor() : WebSocketListener() {
 
     fun sendMessageActionables(type: MessageType, message: MessageActionables) {
         val wrapper = MessageActionablesWrapper(type, message)
-        sendJson(wrapper)
+        sendPacked(wrapper)
     }
 
     fun sendMessageSchema(type: MessageType, message: MessageSchema) {
         val wrapper = MessageSchemaWrapper(type, message)
-        sendJson(wrapper)
+        sendPacked(wrapper)
     }
 
     fun sendMessageTranslation(message: MessageTranslation) {
         val wrapper = MessageTranslationWrapper(MessageType.translationEnded, message)
-        sendJson(wrapper)
+        sendPacked(wrapper)
     }
 
     /// The inspector readout, sent on every pointer event of a drag.
@@ -629,7 +669,7 @@ class WebSocketClient private constructor() : WebSocketListener() {
         if (!isConnected) return
         if ((socket?.queueSize() ?: 0L) > 0L) return
 
-        sendJson(MessageSelectedNodePropertiesWrapper(MessageType.selectedNodeProperties, message))
+        sendPacked(MessageSelectedNodePropertiesWrapper(MessageType.selectedNodeProperties, message))
     }
 
     /// The playhead moves every frame, and a stall anywhere downstream would let
@@ -644,35 +684,32 @@ class WebSocketClient private constructor() : WebSocketListener() {
         if (!isConnected) return
         if (message.isRunning && (socket?.queueSize() ?: 0L) > 0L) return
 
-        sendJson(MessagePlaybackProgressWrapper(MessageType.playbackProgress, message))
+        sendPacked(MessagePlaybackProgressWrapper(MessageType.playbackProgress, message))
     }
 
-    private fun sendJson(wrapper: Any) {
+    private fun sendPacked(wrapper: Any) {
         if (!isConnected || socket == null) return
         try {
-            // Serialize inner payload to JSON string, and take the type off the
+            // Serialize the inner payload on its own, and take the type off the
             // wrapper rather than deriving it from the wrapper's class a second
             // time: the two used to be separate `when`s over the same five
             // classes, which is one place for them to disagree.
-            val (type, payloadJson) = when (wrapper) {
-                is MessageActionableWrapper -> wrapper.type to json.encodeToString(wrapper.payload)
-                is MessageActionablesWrapper -> wrapper.type to json.encodeToString(wrapper.payload)
-                is MessageSchemaWrapper -> wrapper.type to json.encodeToString(wrapper.payload)
-                is MessageTranslationWrapper -> wrapper.type to json.encodeToString(wrapper.payload)
-                is MessagePlaybackProgressWrapper -> wrapper.type to json.encodeToString(wrapper.payload)
-                is MessageSelectedNodePropertiesWrapper -> wrapper.type to json.encodeToString(wrapper.payload)
+            val (type, payloadBytes) = when (wrapper) {
+                is MessageActionableWrapper -> wrapper.type to msgPack.encodeToByteArray(wrapper.payload)
+                is MessageActionablesWrapper -> wrapper.type to msgPack.encodeToByteArray(wrapper.payload)
+                is MessageSchemaWrapper -> wrapper.type to msgPack.encodeToByteArray(wrapper.payload)
+                is MessageTranslationWrapper -> wrapper.type to msgPack.encodeToByteArray(wrapper.payload)
+                is MessagePlaybackProgressWrapper -> wrapper.type to msgPack.encodeToByteArray(wrapper.payload)
+                is MessageSelectedNodePropertiesWrapper -> wrapper.type to msgPack.encodeToByteArray(wrapper.payload)
                 else -> return
             }
 
-            // Encode JSON string to Base64
-            val payloadBase64 = Base64.getEncoder().encodeToString(payloadJson.toByteArray(StandardCharsets.UTF_8))
+            // The envelope carries those bytes as-is, in a `bin` value — no
+            // base64, which is what the JSON envelope needed to hold them.
+            val wrapperBytes = msgPack.encodeToByteArray(MessageWrapper(type.name, payloadBytes))
 
-            // Wrap with type + Base64 payload
-            val wrapperObj = MessageWrapper(type.name, payloadBase64)
-            val wrapperJson = json.encodeToString(wrapperObj)
-
-            // Send as text WebSocket frame
-            socket?.send(wrapperJson)
+            // Binary frame: MessagePack has no text form.
+            socket?.send(wrapperBytes.toByteString())
 
         } catch (e: Exception) {
             e.printStackTrace()
@@ -692,38 +729,35 @@ class WebSocketClient private constructor() : WebSocketListener() {
         onConnect?.invoke()
     }
 
-    override fun onMessage(webSocket: WebSocket, text: String) {
+    override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
         runCatching {
-            // Parse the outer wrapper
-            val wrapper = json.decodeFromString<MessageWrapper>(text)
-
-            // Decode Base64 payload
-            val payloadBytes = Base64.getDecoder().decode(wrapper.payload)
-            val payloadJson = String(payloadBytes, StandardCharsets.UTF_8)
+            // Parse the outer wrapper, whose payload is the inner message's own
+            // bytes — no base64 to undo.
+            val wrapper = msgPack.decodeFromByteArray<MessageWrapper>(bytes.toByteArray())
 
             // Deserialize based on type. A type this runtime has no case for —
             // one of its own reports echoed back, or something a newer editor
             // sends — resolves to null and falls through the `when`.
             when (MessageType.entries.firstOrNull { it.name == wrapper.type }) {
                 MessageType.actionable -> {
-                    val decoded = json.decodeFromString<MessageActionable>(payloadJson)
+                    val decoded = msgPack.decodeFromByteArray<MessageActionable>(wrapper.payload)
                     scope.launch { _onIsActionable.emit(decoded.isActionable) }
                 }
                 MessageType.actionables -> {
-                    val decoded = json.decodeFromString<MessageActionables>(payloadJson)
+                    val decoded = msgPack.decodeFromByteArray<MessageActionables>(wrapper.payload)
                     scope.launch { _onSelectedIds.emit(decoded.actionableIds) }
                 }
                 MessageType.schema -> {
-                    val decoded = json.decodeFromString<MessageSchema>(payloadJson)
+                    val decoded = msgPack.decodeFromByteArray<MessageSchema>(wrapper.payload)
                     scope.launch { _onSchema.emit(decoded.schemaWrappers) }
                 }
                 MessageType.signal -> {
-                    // Decoded by hand: the signal is a Swift enum with associated
-                    // values, whose synthesized encoding has no fixed key set.
-                    val obj = json.parseToJsonElement(payloadJson).jsonObject
-                    val signal = decodeAnimationSignal(obj["signal"]?.jsonObject) ?: return@runCatching
-                    val sequence = obj["sequence"]?.jsonPrimitive?.intOrNull ?: 0
-                    scope.launch { _onSignal.emit(signal to sequence) }
+                    // Decoded through a DTO of its own: the signal is a Swift
+                    // enum with associated values, so which key is present is
+                    // what names the case.
+                    val decoded = msgPack.decodeFromByteArray<MessageSignalDTO>(wrapper.payload)
+                    val signal = decodeAnimationSignal(decoded.signal) ?: return@runCatching
+                    scope.launch { _onSignal.emit(signal to decoded.sequence) }
                 }
                 // The four this runtime only ever sends — plus null, an
                 // unrecognized type — are not errors to receive.
@@ -736,8 +770,10 @@ class WebSocketClient private constructor() : WebSocketListener() {
         }.onFailure { it.printStackTrace() }
     }
 
-    override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-        onMessage(webSocket, bytes.string(StandardCharsets.UTF_8))
+    /// Nothing on this channel has a text form any more. The editor sends
+    /// binary frames; a text one is not something this runtime can read.
+    override fun onMessage(webSocket: WebSocket, text: String) {
+        InertiaLog.error("ignoring an unexpected text frame (${text.length} chars) — frames are MessagePack")
     }
 
     /// The editor going away sends a close that has to be answered before the
@@ -1596,25 +1632,26 @@ fun InertiaContainer(
     val context = LocalContext.current
 
     /// Outside the editor the schemas come from the shipped animation file
-    /// rather than the socket, the way the SwiftUI runtime reads `<id>.json`
-    /// from its bundle and the React runtime fetches it from `baseURL`. A
-    /// missing or unreadable file leaves the actionables at their layout
-    /// positions rather than bringing the app down — a broken animation is not
-    /// worth a crash.
+    /// rather than the socket, the way the SwiftUI runtime reads
+    /// `<id>.msgpack` from its bundle and the React runtime fetches it from
+    /// `baseURL`. A missing or unreadable file leaves the actionables at their
+    /// layout positions rather than bringing the app down — a broken animation
+    /// is not worth a crash.
     LaunchedEffect(dev, id) {
         if (dev) return@LaunchedEffect
 
+        val fileName = "$id.$INERTIA_FILE_EXTENSION"
         val schemas = try {
-            val text = context.assets.open("$id.json")
-                .bufferedReader(StandardCharsets.UTF_8)
-                .use { it.readText() }
-            inertiaJson.decodeFromString<List<InertiaAnimationSchema>>(text)
+            // Read as bytes rather than text: the file is MessagePack, and most
+            // of it is not valid UTF-8.
+            val bytes = context.assets.open(fileName).use { it.readBytes() }
+            inertiaMsgPack.decodeFromByteArray<List<InertiaAnimationSchema>>(bytes)
         } catch (error: Exception) {
-            InertiaLog.error("failed to load $id.json: $error")
+            InertiaLog.error("failed to load $fileName: $error")
             return@LaunchedEffect
         }
 
-        InertiaLog.debug("loaded ${schemas.size} schema(s) from $id.json")
+        InertiaLog.debug("loaded ${schemas.size} schema(s) from $fileName")
 
         // Keyed by the id they were authored against, which is the `id` an
         // actionable hands to [Inertia]: there are no per-instance ids on disk.
