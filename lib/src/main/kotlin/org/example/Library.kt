@@ -14,6 +14,7 @@ import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
@@ -1486,6 +1487,15 @@ object SharedIndexManager {
 
 // ========== COMPOSABLES ==========
 
+/// The frame every animation in it is measured against.
+///
+/// A `translate` of 1 crosses the whole container, so what the container *is* has
+/// to mean the same thing on every runtime or one authored animation moves a
+/// different distance on each. It is the space the host offers this composable,
+/// filled — the same rectangle SwiftUI's `GeometryReader` reports and the React
+/// runtime's container div occupies. A container that sized itself to its
+/// content instead would be as big as whatever happened to be inside it, which
+/// is not something the editor can know while the animation is being authored.
 @Composable
 fun InertiaContainer(
     id: String,
@@ -1592,11 +1602,21 @@ fun InertiaContainer(
 
     Box(
         modifier = Modifier
-            .wrapContentSize()
+            // The space the host offered, filled — see this composable's doc.
+            // This used to be `wrapContentSize()`, which sized the container to
+            // whatever was inside it: the same `translate: [0.5, 0]` then moved
+            // a card half the width of the *content* on Android and half the
+            // width of the *screen* on iOS and the web.
+            .fillMaxSize()
             .onSizeChanged { size = it }
             // The frame the guides are measured against, so a position taken in
             // an actionable and a point drawn in the overlay share an origin.
-            .onGloballyPositioned { guides.containerCoordinates = it }
+            .onGloballyPositioned { guides.containerCoordinates = it },
+        // What `wrapContentSize` gave for free and filling the space does not:
+        // content smaller than the container sits in the middle of it rather
+        // than in its top-left corner. The same placement as the SwiftUI
+        // runtime's `ZStack(alignment: .center)`.
+        contentAlignment = Alignment.Center
     ) {
         CompositionLocalProvider(
             LocalInertia provides playback,
@@ -1613,8 +1633,9 @@ fun InertiaContainer(
             // Composed whether or not a drag is in progress — it draws nothing
             // when there is none — so the container's composition never depends
             // on the overlay's state. `matchParentSize` rather than
-            // `fillMaxSize`: the container wraps its content, and an overlay that
-            // took part in that measurement would grow it to the whole screen.
+            // `fillMaxSize`: the overlay spans the container without taking part
+            // in measuring it, which is what keeps it out of the way of whatever
+            // constraints the host handed down.
             InertiaAlignmentGrid(guides, Modifier.matchParentSize())
         }
     }
