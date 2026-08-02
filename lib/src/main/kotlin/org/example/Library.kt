@@ -4,6 +4,7 @@ import android.util.Log
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -1974,10 +1975,14 @@ fun Inertiaable(
     }
 }
 
+/// A stroke rather than a fill, and `border` rather than `background`, so it
+/// lands over the content this node wraps: a background draws behind that
+/// content and any opaque child hides it entirely. Matches the Swift runtime's
+/// `.overlay { Rectangle().stroke(.green) }`.
 @Composable
 private fun modifierSelectedBorder(show: Boolean): Modifier =
     if (!show) Modifier
-    else Modifier.background(Color.Green)
+    else Modifier.border(2.dp, Color.Green)
 
 // ========== UTILITIES ==========
 
