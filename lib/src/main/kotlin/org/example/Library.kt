@@ -1976,9 +1976,14 @@ private fun InertiaToolHandleChrome(
         val geometry = target.geometry()
         if (!geometry.isDrawable) return@Canvas
 
-        val stroke = 1.dp.toPx()
-        val dash = 4.dp.toPx()
-        val dashEffect = PathEffect.dashPathEffect(floatArrayOf(dash, dash))
+        // The knob's own outline stays fine; the rings and the track are
+        // heavier, so they read against whatever the app happens to be drawing
+        // underneath them.
+        val stroke = 1.5.dp.toPx()
+        val chromeStroke = 3.dp.toPx()
+        val dashEffect = PathEffect.dashPathEffect(
+            floatArrayOf(9.dp.toPx(), 7.dp.toPx())
+        )
 
         when (geometry.tool) {
             InertiaTool.translate -> Unit
@@ -1992,13 +1997,13 @@ private fun InertiaToolHandleChrome(
                     radius = (knob - anchor).getDistance(),
                     center = anchor,
                     alpha = 0.6f,
-                    style = Stroke(width = stroke, pathEffect = dashEffect)
+                    style = Stroke(width = chromeStroke, pathEffect = dashEffect)
                 )
                 drawLine(
                     color = handleColor,
                     start = anchor,
                     end = knob,
-                    strokeWidth = stroke,
+                    strokeWidth = chromeStroke,
                     alpha = 0.6f
                 )
             }
@@ -2012,7 +2017,7 @@ private fun InertiaToolHandleChrome(
                     start.x + (end.x - start.x) * fraction,
                     start.y + (end.y - start.y) * fraction
                 )
-                val thickness = 4.dp.toPx()
+                val thickness = 7.dp.toPx()
 
                 drawLine(handleColor, start, end, strokeWidth = thickness, alpha = 0.25f)
                 drawLine(handleColor, start, filled, strokeWidth = thickness)
@@ -2034,7 +2039,7 @@ private fun InertiaToolHandleChrome(
                 text = text,
                 style = TextStyle(
                     color = Color.White,
-                    fontSize = 15.sp,
+                    fontSize = 24.sp,
                     fontWeight = FontWeight.SemiBold,
                     fontFamily = FontFamily.Monospace
                 )
@@ -2042,8 +2047,8 @@ private fun InertiaToolHandleChrome(
             // Above the node's top-left, clear of every knob, and never turned
             // with it — a number is only readable one way up.
             val topLeft = geometry.drawn(Offset.Zero) -
-                Offset(0f, InertiaToolHandleGeometry.knobGap + 44f)
-            val padding = 6.dp.toPx()
+                Offset(0f, InertiaToolHandleGeometry.knobGap + 64f)
+            val padding = 9.dp.toPx()
 
             drawRoundRect(
                 color = handleColor,
@@ -2597,16 +2602,38 @@ fun Inertia(
     /// from and which the editor is told the total of.
     val initialValues = animation?.initialValues?.sanitized() ?: InertiaAnimationValues()
 
+    // Anything a gesture reads has to reach it through a state holder rather
+    // than be captured by value.
+    //
+    // Both gestures outlive the composition that set them up: `pointerInput`
+    // launches its block once per key change and keeps that one coroutine
+    // running, and the handle callbacks are held by whatever target was last
+    // published. A plain capture is frozen at whatever it was when either of
+    // those started. `model` is the one that bites: the tap toggle computes the
+    // new selection from `model.actionableIds`, and against a frozen copy the
+    // first tap adds this node's pair and every tap after it re-adds the same
+    // pair to the same stale set — a node that selects and can then never be
+    // tapped off again.
+    //
+    // `isSelected`, `edit` and `instanceId` need none of this: a local `var`
+    // held by `mutableStateOf` captures the state object, so reads inside a
+    // long-running block are already live.
+    val currentModel by rememberUpdatedState(model)
+    val currentTool by rememberUpdatedState(tool)
+    val currentUpdateModel by rememberUpdatedState(updateModel)
+    val currentInitialValues by rememberUpdatedState(initialValues)
+    val currentCanvasSize by rememberUpdatedState(canvasSize)
+
     /// Shows what a gesture has produced so far and reports it to the editor's
     /// inspector. Nothing is authored by this — see the commit below.
     val applyEdit = { next: InertiaToolEdit ->
         edit = next
 
-        val authored = initialValues.applying(next, canvasSize)
+        val authored = currentInitialValues.applying(next, currentCanvasSize)
         WebSocketClient.shared.sendMessageSelectedNodeProperties(
             MessageSelectedNodeProperties(
-                positionX = authored.translate.getOrElse(0) { 0f } * canvasSize.width,
-                positionY = authored.translate.getOrElse(1) { 0f } * canvasSize.height,
+                positionX = authored.translate.getOrElse(0) { 0f } * currentCanvasSize.width,
+                positionY = authored.translate.getOrElse(1) { 0f } * currentCanvasSize.height,
                 sizeX = measurement.size.width,
                 sizeY = measurement.size.height,
                 values = authored
@@ -2619,12 +2646,15 @@ fun Inertia(
     /// keyframe holds all five values, so the four this gesture did not touch
     /// have to travel with the one it did.
     val commitEdit = {
-        val m = model
-        if (m != null && canvasSize != IntSize.Zero) {
+        val m = currentModel
+        if (m != null && currentCanvasSize != IntSize.Zero) {
             WebSocketClient.shared.sendMessageEdit(
                 MessageEdit(
-                    tool = tool,
-                    values = initialValues.applying(edit, canvasSize),
+                    tool = currentTool,
+                    values = currentInitialValues.applying(edit, currentCanvasSize),
+                    // The whole selection as it stands now, not as it stood when
+                    // this gesture's handles were published: an edit is authored
+                    // against every node the editor has picked.
                     actionableIds = m.actionableIds.toSet()
                 )
             )
@@ -2649,7 +2679,7 @@ fun Inertia(
     val beginHandleGesture = { position: Offset ->
         val (origin, size) = measureLayoutBox()
         val values = sample()
-        val anchor = InertiaToolHandleGeometry(tool, values, origin, size, canvasSize).anchor
+        val anchor = InertiaToolHandleGeometry(currentTool, values, origin, size, canvasSize).anchor
 
         handleGesture.start = InertiaToolGestureStart(
             anchor = anchor,
@@ -2762,26 +2792,6 @@ fun Inertia(
         }
     }
 
-    // Everything the gesture below reads has to reach it through a state holder
-    // rather than be captured by value.
-    //
-    // `pointerInput` launches its block once per key change and then keeps that
-    // one coroutine running across every recomposition, so a plain capture is
-    // frozen at whatever it was when the block started. `model` is the one that
-    // bites: the tap toggle computes the new selection from `model.actionableIds`,
-    // and against a frozen copy the first tap adds this node's pair and every tap
-    // after it re-adds the same pair to the same stale set — which is a node that
-    // selects and can then never be tapped off again.
-    //
-    // `isSelected`, `edit` and `instanceId` need none of this: a local `var` held
-    // by `mutableStateOf` captures the state object, so reads inside the block
-    // are already live.
-    val currentModel by rememberUpdatedState(model)
-    val currentTool by rememberUpdatedState(tool)
-    val currentUpdateModel by rememberUpdatedState(updateModel)
-    val currentApplyEdit by rememberUpdatedState(applyEdit)
-    val currentCommitEdit by rememberUpdatedState(commitEdit)
-
     // When in actionable mode, handle both tap (for selection) and drag (for the
     // move tool). Every other tool is driven from the container's handle overlay
     // — see [InertiaToolHandlesOverlay] for why the knobs cannot live in here.
@@ -2830,7 +2840,7 @@ fun Inertia(
                                 // adding up only the latter leaves the threshold
                                 // subtracted from the drag, and the node trailing
                                 // the pointer by it for the rest of the gesture.
-                                currentApplyEdit(startEdit.copy(translate = startEdit.translate + totalDrag))
+                                applyEdit(startEdit.copy(translate = startEdit.translate + totalDrag))
                                 if (showAlignmentGrid) {
                                     // The box the node is *drawn* in, rather than
                                     // the one it was laid out in: the schema's
@@ -2861,7 +2871,7 @@ fun Inertia(
                 if (showAlignmentGrid) guides?.hide()
 
                 if (hasDragged && canDragBody) {
-                    currentCommitEdit()
+                    commitEdit()
                 } else if (!hasDragged) {
                     // It was a tap, toggle selection
                     val instance = instanceId
