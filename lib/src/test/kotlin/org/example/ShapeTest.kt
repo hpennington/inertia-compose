@@ -52,6 +52,7 @@ class ShapeTest {
             invokeType = InertiaAnimationInvokeType.trigger,
             shapes = listOf(
                 InertiaShape(
+                    id = "card0-rectangle",
                     vertices = listOf(
                         shapedCorner(0f, 0f, 0.35f, 0.1f, 0.85f),
                         shapedCorner(1f, 0f, 0.1f, 0.55f, 0.95f),
@@ -74,6 +75,29 @@ class ShapeTest {
         assertEquals(4, card0.shapes[0].vertices.size)
         assertEquals(InertiaPoint(0f, 0f), card0.shapes[0].vertices[0].position)
         assertEquals(0.6f, card0.shapes[0].vertices[0].color.alpha)
+    }
+
+    /// A shape's id is how anything points at it: the editor's hierarchy panel,
+    /// the selection sent back here, and the edit that selection authors. It has
+    /// to survive the file, or a shape can be drawn and never picked.
+    @Test
+    fun `shape id survives the wire`() {
+        val card0 = demoSchemas().getValue("card0")
+
+        assertEquals("card0-rectangle", card0.shapes[0].id)
+    }
+
+    /// Normalizing restates a shape in its canvas's own space, which is about
+    /// where it is drawn and not about what it is. A shape that came out the
+    /// other side unnamed would be drawn and then unselectable.
+    @Test
+    fun `normalizing keeps the shape's id`() {
+        val shape = InertiaShape(
+            id = "named",
+            vertices = listOf(corner(0f, 0f), corner(2f, 0f), corner(2f, 2f))
+        )
+
+        assertEquals("named", shape.normalized(Rect(0f, 0f, 2f, 2f)).id)
     }
 
     /// An animation authored before shapes existed — or one that simply wants
@@ -99,7 +123,7 @@ class ShapeTest {
     fun `shape is triangulated as a fan`() {
         val corners = (0..3).map { corner(it.toFloat(), it.toFloat()) }
 
-        val triangles = InertiaShape(corners).triangles()
+        val triangles = InertiaShape(id = "fan", vertices = corners).triangles()
 
         assertEquals(6, triangles.size)
         assertEquals(listOf(0f, 1f, 2f, 0f, 2f, 3f), triangles.map { it.position.x })
@@ -110,7 +134,8 @@ class ShapeTest {
     @Test
     fun `bounds of a shape filling the actionable`() {
         val shape = InertiaShape(
-            listOf(corner(0f, 0f), corner(1f, 0f), corner(1f, 1f), corner(0f, 1f))
+            id = "filling",
+            vertices = listOf(corner(0f, 0f), corner(1f, 0f), corner(1f, 1f), corner(0f, 1f))
         )
 
         assertEquals(Rect(0f, 0f, 1f, 1f), listOf(shape).bounds())
@@ -122,7 +147,10 @@ class ShapeTest {
     /// width before its left, so the canvas spans 1.7 of it.
     @Test
     fun `bounds grow to hold shapes outside the actionable`() {
-        val shape = InertiaShape(listOf(corner(-0.5f, 0f), corner(1.2f, 0f), corner(1.2f, 3f)))
+        val shape = InertiaShape(
+            id = "overhanging",
+            vertices = listOf(corner(-0.5f, 0f), corner(1.2f, 0f), corner(1.2f, 3f))
+        )
 
         val bounds = assertNotNull(listOf(shape).bounds())
 
@@ -134,8 +162,8 @@ class ShapeTest {
     /// Several shapes share one canvas, so the box has to hold all of them.
     @Test
     fun `bounds span every shape`() {
-        val left = InertiaShape(listOf(corner(-1f, 0f), corner(0f, 0f), corner(0f, 1f)))
-        val right = InertiaShape(listOf(corner(1f, 0f), corner(2f, 0f), corner(2f, 0.5f)))
+        val left = InertiaShape(id = "left", vertices = listOf(corner(-1f, 0f), corner(0f, 0f), corner(0f, 1f)))
+        val right = InertiaShape(id = "right", vertices = listOf(corner(1f, 0f), corner(2f, 0f), corner(2f, 0.5f)))
 
         assertEquals(Rect(-1f, 0f, 2f, 1f), listOf(left, right).bounds())
     }
@@ -145,8 +173,8 @@ class ShapeTest {
     @Test
     fun `bounds of empty or degenerate shapes are null`() {
         assertNull(emptyList<InertiaShape>().bounds())
-        assertNull(listOf(InertiaShape(emptyList())).bounds())
-        assertNull(listOf(InertiaShape(listOf(corner(1f, 0f), corner(1f, 1f)))).bounds())
+        assertNull(listOf(InertiaShape(id = "empty")).bounds())
+        assertNull(listOf(InertiaShape(id = "line", vertices = listOf(corner(1f, 0f), corner(1f, 1f)))).bounds())
     }
 
     /// Whatever box the canvas ends up being, the renderer is handed the shape
@@ -154,7 +182,10 @@ class ShapeTest {
     /// of the bounds lands exactly on it.
     @Test
     fun `shape is normalized into the canvas bounds`() {
-        val shape = InertiaShape(listOf(corner(-0.5f, 0f), corner(1.5f, 0f), corner(1.5f, 2f)))
+        val shape = InertiaShape(
+            id = "normalized",
+            vertices = listOf(corner(-0.5f, 0f), corner(1.5f, 0f), corner(1.5f, 2f))
+        )
 
         val normalized = shape.normalized(Rect(left = -0.5f, top = 0f, right = 1.5f, bottom = 2f))
 
@@ -167,8 +198,11 @@ class ShapeTest {
     /// partial triangle would have it read past the end of the list.
     @Test
     fun `shape with too few corners draws nothing`() {
-        assertEquals(emptyList(), InertiaShape(emptyList()).triangles())
-        assertEquals(emptyList(), InertiaShape(listOf(corner(0f, 0f), corner(1f, 1f))).triangles())
+        assertEquals(emptyList(), InertiaShape(id = "empty").triangles())
+        assertEquals(
+            emptyList(),
+            InertiaShape(id = "line", vertices = listOf(corner(0f, 0f), corner(1f, 1f))).triangles()
+        )
     }
 
     // -- Shapes that carry an animation --
@@ -184,6 +218,7 @@ class ShapeTest {
             invokeType = InertiaAnimationInvokeType.auto,
             shapes = listOf(
                 InertiaShape(
+                    id = "card2-shape-0",
                     shape = InertiaShapeProperties(
                         id = "123",
                         type = InertiaShapeType.rectangle,
@@ -257,6 +292,7 @@ class ShapeTest {
         height: Float,
         color: InertiaColor = InertiaColor(red = 1f, green = 0f, blue = 0f, alpha = 1f)
     ) = InertiaShape(
+        id = "described",
         shape = InertiaShapeProperties(id = "123", type = type, width = width, height = height, color = color)
     )
 

@@ -9,17 +9,25 @@ import android.opengl.EGLDisplay
 import android.opengl.EGLSurface
 import android.opengl.GLES20
 import android.view.TextureView
+import androidx.compose.foundation.border
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -334,7 +342,11 @@ internal fun InertiaShapeCanvas(
     actionableSize: IntSize,
     animation: InertiaAnimationSchema? = null,
     hierarchyIdPrefix: String? = null,
-    containerSize: IntSize = IntSize.Zero
+    containerSize: IntSize = IntSize.Zero,
+    /// Present only in the editor, and only while the viewport is in actionable
+    /// mode. A canvas holding one selected shape grows a border and publishes
+    /// the handles the container's overlay draws — see [InertiaShapeEditing].
+    editing: InertiaShapeEditing? = null
 ) {
     val bounds = remember(shapes) { shapes.bounds() } ?: return
 
@@ -349,12 +361,41 @@ internal fun InertiaShapeCanvas(
     val left = (bounds.left * actionableSize.width).roundToInt()
     val top = (bounds.top * actionableSize.height).roundToInt()
 
+    /// The one shape this canvas holds, when the editor has picked it. Selection
+    /// is what gives a shape a canvas to itself, so there is never more than one.
+    val selected = shapes.singleOrNull()?.takeIf { editing?.isSelected(it) == true }
+
+    /// What this shape is drawn at right now: its own track at the playhead with
+    /// the gesture in progress folded in, and nothing of the actionable's — that
+    /// transform is on the element this canvas sits inside, and is handed to the
+    /// chrome separately as its outer one.
+    val sample = shapeSample(animation, hierarchyIdPrefix, containerSize) {
+        selected?.let { editing?.edit(it) } ?: InertiaToolEdit()
+    }
+
+    InertiaShapeHandles(
+        selected = selected,
+        editing = editing,
+        sample = sample,
+        containerSize = containerSize,
+        shapeLayoutOffset = Offset(left.toFloat(), top.toFloat()),
+        shapeLayoutSize = Size(width.toFloat(), height.toFloat())
+    )
+
     Layout(
         content = {
             AndroidView(
                 factory = { context -> InertiaShapeTextureView(context) },
                 update = { view -> view.vertexData = vertexData },
-                modifier = shapeAnimationModifier(animation, hierarchyIdPrefix, containerSize)
+                modifier = shapeAnimationModifier(
+                    isTransformed = animation != null || selected != null,
+                    containerSize = containerSize,
+                    sample = sample
+                )
+                    // Inside every layer above, so the border stays glued to the
+                    // shape as it turns and scales — exactly where an
+                    // actionable's own sits relative to it.
+                    .then(if (selected != null) Modifier.border(2.dp, Color.Green) else Modifier)
             )
         }
     ) { measurables, _ ->
@@ -367,8 +408,150 @@ internal fun InertiaShapeCanvas(
     }
 }
 
-/// The layers that move a shape drawn on its own track, or nothing at all for a
-/// shape that is part of the actionable's backdrop.
+/// Publishes a selected shape's handles to the container's overlay, and runs the
+/// gesture they open.
+///
+/// The same chrome an actionable shows and the same tools, because a shape is
+/// edited exactly as a view is: one palette, one gesture, one `MessageEdit`.
+/// What differs is where it is measured from — the shape's box sits inside the
+/// actionable's transform, which the overlay is handed as
+/// [InertiaToolHandleTarget.outer] — and what the resulting edit names, which is
+/// the shape's own id.
+///
+/// Draws nothing itself. The knobs live in the container's overlay, for the
+/// reason [InertiaToolHandlesOverlay] gives, and this only hands that overlay
+/// what it needs.
+@Composable
+private fun InertiaShapeHandles(
+    selected: InertiaShape?,
+    editing: InertiaShapeEditing?,
+    sample: () -> InertiaAnimationValues,
+    containerSize: IntSize,
+    /// Where this shape's box sits inside the actionable's, as laid out — before
+    /// either transform. Added to the actionable's own layout origin, it is the
+    /// box the handles are turned about.
+    shapeLayoutOffset: Offset,
+    shapeLayoutSize: Size
+) {
+    /// Where the gesture opened, taken once so its math stays measured against
+    /// the transform the shape had before it. A plain field: written per pointer
+    /// event and never read from composition.
+    val gesture = remember { InertiaToolGesture() }
+
+    val currentSample by rememberUpdatedState(sample)
+    val currentEditing by rememberUpdatedState(editing)
+    val currentSelected by rememberUpdatedState(selected)
+    val currentOffset by rememberUpdatedState(shapeLayoutOffset)
+    val currentSize by rememberUpdatedState(shapeLayoutSize)
+    val currentContainerSize by rememberUpdatedState(containerSize)
+
+    /// The actionable's box and this shape's own inside it, both in the
+    /// container's space and both outside every transform — which is the frame
+    /// the handles are turned about. Measured, so it is called when the handles
+    /// are published and when a gesture opens rather than per frame.
+    val measureBoxes = {
+        val outer = currentEditing?.outerLayoutBox()?.let { (origin, size) ->
+            InertiaOuterTransform(InertiaAnimationValues(), origin, size)
+        }
+        outer to ((outer?.layoutOrigin ?: Offset.Zero) + currentOffset to currentSize)
+    }
+
+    if (selected != null && editing?.handles != null && containerSize != IntSize.Zero) {
+        // Republished rather than left as it was: the geometry it carries is
+        // measured, and a shape that has been re-laid out or handed a new track
+        // is not where the last target says it is. A gesture needs no republish,
+        // since the overlay reads the values back through the lambdas.
+        LaunchedEffect(
+            editing.handles,
+            editing.tool,
+            editing.owner(selected),
+            containerSize,
+            shapeLayoutOffset,
+            shapeLayoutSize
+        ) {
+            val (outerBox, shapeBox) = measureBoxes()
+            val (origin, size) = shapeBox
+
+            editing.handles.show(
+                InertiaToolHandleTarget(
+                    owner = editing.owner(selected),
+                    tool = editing.tool,
+                    values = { currentSample() },
+                    layoutOrigin = origin,
+                    layoutSize = size,
+                    canvasSize = containerSize,
+                    // The box is the one measured just now; only the values are
+                    // read per frame, which is what lets the chrome follow an
+                    // actionable that is animating without walking the layout
+                    // tree on every one.
+                    outer = {
+                        InertiaOuterTransform(
+                            currentEditing?.outerValues?.invoke() ?: InertiaAnimationValues(),
+                            outerBox?.layoutOrigin ?: Offset.Zero,
+                            outerBox?.layoutSize ?: Size.Zero
+                        )
+                    },
+                    movesByKnob = true,
+                    onBegin = { index, position ->
+                        val shape = currentSelected ?: return@InertiaToolHandleTarget
+                        val edits = currentEditing ?: return@InertiaToolHandleTarget
+                        val (gestureOuter, gestureBox) = measureBoxes()
+                        val (gestureOrigin, gestureSize) = gestureBox
+
+                        gesture.start = openToolGesture(
+                            tool = edits.tool,
+                            knobIndex = index,
+                            position = position,
+                            values = currentSample(),
+                            edit = edits.edit(shape),
+                            layoutOrigin = gestureOrigin,
+                            layoutSize = gestureSize,
+                            canvasSize = currentContainerSize,
+                            outer = InertiaOuterTransform(
+                                edits.outerValues(),
+                                gestureOuter?.layoutOrigin ?: Offset.Zero,
+                                gestureOuter?.layoutSize ?: Size.Zero
+                            ),
+                            movesByKnob = true
+                        )
+                    },
+                    onDrag = { position ->
+                        val shape = currentSelected
+                        val edits = currentEditing
+                        val opening = gesture.start
+                        if (shape != null && edits != null && opening != null) {
+                            edits.onChange(shape, opening.editAt(edits.tool, position))
+                        }
+                    },
+                    onEnd = {
+                        val shape = currentSelected
+                        if (gesture.start != null && shape != null) {
+                            gesture.start = null
+                            currentEditing?.onEnded(shape)
+                        }
+                    }
+                )
+            )
+        }
+    }
+
+    // Leaving composition, or being deselected, takes the handles with it.
+    // Without this a shape that goes away mid-selection leaves chrome behind
+    // with nothing under it. Only ever takes down its own: every selected shape
+    // runs this, and one has no business clearing another's.
+    val owner = selected?.let { editing?.owner(it) }
+    DisposableEffect(editing?.handles, owner) {
+        onDispose {
+            val store = editing?.handles
+            if (owner != null && store?.target?.owner == owner) {
+                store.hide()
+            }
+        }
+    }
+}
+
+/// What one shape is drawn at, given where the playhead is and what the editor's
+/// gesture has added on top.
 ///
 /// Read at the same playhead as everything else, so a shape moves in time with
 /// the actionable it was authored behind rather than on a clock of its own — and
@@ -377,37 +560,68 @@ internal fun InertiaShapeCanvas(
 /// as soon as the clock does, even while the actionable it backs is still
 /// waiting on the app to trigger it.
 ///
+/// A lambda, not a value: the playhead and the edit are read when it is
+/// *called*, which is from a `graphicsLayer` block or a gesture callback. A read
+/// in composition would recompose the canvas on every frame of every run.
+///
+/// A shape authored as backdrop has no track and sits at the identity, which is
+/// where the first edit on it is measured from — the editor writes that edit
+/// into a track the shape did not have until then.
+@Composable
+private fun shapeSample(
+    animation: InertiaAnimationSchema?,
+    hierarchyIdPrefix: String?,
+    containerSize: IntSize,
+    edit: () -> InertiaToolEdit
+): () -> InertiaAnimationValues {
+    val playback = LocalInertia.current
+
+    return {
+        val base = if (animation == null) {
+            InertiaAnimationValues()
+        } else {
+            val isTriggered = hierarchyIdPrefix?.let { playback.isPlaying(it) } == true
+            val isPlayable = isTriggered || animation.invokeType == InertiaAnimationInvokeType.auto
+            // Scrubbing shows the animation without running it, which is why a
+            // parked playhead draws the same way a running one does.
+            val isShowingTrack = isPlayable && (playback.isRunning || playback.seekTime != null)
+
+            if (isShowingTrack) {
+                animation.valuesAtTime(
+                    playback.playheadTime,
+                    playback.playbackDuration,
+                    playback.isRepeating
+                )
+            } else {
+                animation.initialValues.sanitized()
+            }
+        }
+
+        // One matrix for the track and the gesture together, rather than the
+        // gesture applied as an offset outside the animation's own layers: what
+        // the editor is sent is a single set of values, and this is what makes
+        // the shape's appearance agree with them.
+        if (containerSize == IntSize.Zero) base else base.applying(edit(), containerSize)
+    }
+}
+
+/// The layers that move a shape drawn on its own track — or dragged by the
+/// editor — and nothing at all for a shape that is only backdrop.
+///
 /// The layers are stacked exactly as [InertiaActionable] stacks its own, for the
 /// reasons set out there: the playhead is read inside the layer blocks rather
 /// than in composition, and the two rotations want a layer each because they
 /// pivot on different points.
 @Composable
 private fun shapeAnimationModifier(
-    animation: InertiaAnimationSchema?,
-    hierarchyIdPrefix: String?,
-    containerSize: IntSize
+    /// Whether there is anything for these layers to carry: a track, or the
+    /// editor's gesture. A shape with neither is drawn where it was authored and
+    /// wants no layer at all.
+    isTransformed: Boolean,
+    containerSize: IntSize,
+    sample: () -> InertiaAnimationValues
 ): Modifier {
-    val playback = LocalInertia.current
-
-    if (animation == null || containerSize == IntSize.Zero) return Modifier
-
-    val sample = {
-        val isTriggered = hierarchyIdPrefix?.let { playback.isPlaying(it) } == true
-        val isPlayable = isTriggered || animation.invokeType == InertiaAnimationInvokeType.auto
-        // Scrubbing shows the animation without running it, which is why a
-        // parked playhead draws the same way a running one does.
-        val isShowingTrack = isPlayable && (playback.isRunning || playback.seekTime != null)
-
-        if (isShowingTrack) {
-            animation.valuesAtTime(
-                playback.playheadTime,
-                playback.playbackDuration,
-                playback.isRepeating
-            )
-        } else {
-            animation.initialValues.sanitized()
-        }
-    }
+    if (!isTransformed || containerSize == IntSize.Zero) return Modifier
 
     return Modifier
         .graphicsLayer {

@@ -264,6 +264,14 @@ data class InertiaShapeProperties(
 /// the actionable it was authored against carries both.
 @Serializable
 data class InertiaShape(
+    /// What this shape is, to anything that has to point at it: the editor's
+    /// hierarchy panel, the selection sent back to the runtime, and the edit
+    /// that selection authors.
+    ///
+    /// A shape used to be addressable only by where it sat — whose schema held
+    /// it, and how far down the list — which is a name that changes when the
+    /// shape either side of it is deleted. This does not.
+    val id: String,
     val vertices: List<Vertex> = emptyList(),
     val shape: InertiaShapeProperties? = null,
     val animation: InertiaAnimationSchema? = null
@@ -376,13 +384,32 @@ internal fun InertiaAnimationValues.drawnPoint(
     layoutOrigin: Offset,
     layoutSize: Size,
     canvasSize: IntSize
+): Offset = drawnContainerPoint(
+    Offset(layoutOrigin.x + local.x, layoutOrigin.y + local.y),
+    layoutOrigin,
+    layoutSize,
+    canvasSize
+)
+
+/// The same, for a point already given in the container's space rather than as
+/// an offset into [layoutOrigin]'s box.
+///
+/// What composes two of these. A shape's handles sit inside the actionable's
+/// transform as well as the shape's own, so a knob is this transform applied to
+/// a point the inner one has already moved — and that point is a container
+/// point, not an offset into a box.
+internal fun InertiaAnimationValues.drawnContainerPoint(
+    containerPoint: Offset,
+    layoutOrigin: Offset,
+    layoutSize: Size,
+    canvasSize: IntSize
 ): Offset {
     val center = Offset(
         layoutOrigin.x + layoutSize.width / 2f,
         layoutOrigin.y + layoutSize.height / 2f
     )
 
-    var point = Offset(layoutOrigin.x + local.x, layoutOrigin.y + local.y)
+    var point = containerPoint
     point = Offset(
         center.x + (point.x - center.x) * scale,
         center.y + (point.y - center.y) * scale
@@ -395,6 +422,34 @@ internal fun InertiaAnimationValues.drawnPoint(
         point.y + translate.getOrElse(1) { 0f } * canvasSize.height
     )
 }
+
+/// A drag measured on screen, restated in the space *inside* this transform —
+/// which is where an offset stacked under it is measured.
+///
+/// A shape is moved by an offset applied within the actionable's own rotation
+/// and scale, so a drag to the right across a turned actionable is not a move to
+/// the right in the space the shape's offset lands in. Undoing the turn and the
+/// scale is what keeps the shape under the finger.
+internal fun InertiaAnimationValues.unapplying(translation: Offset): Offset {
+    val radians = -(rotate + rotateCenter) * PI.toFloat() / 180f
+    val divisor = if (scale.isFinite() && abs(scale) > minimumToolScale) scale else 1f
+
+    return Offset(
+        (translation.x * cos(radians) - translation.y * sin(radians)) / divisor,
+        (translation.x * sin(radians) + translation.y * cos(radians)) / divisor
+    )
+}
+
+/// A transform something's handles are drawn inside of, rather than beside.
+///
+/// What the actionable's animation is to a shape drawn behind it: the values it
+/// is displayed with, and the box those values turn and scale about. See
+/// [InertiaToolHandleGeometry.outer].
+data class InertiaOuterTransform(
+    val values: InertiaAnimationValues,
+    val layoutOrigin: Offset,
+    val layoutSize: Size
+)
 
 private fun Offset.rotatedAround(anchor: Offset, degrees: Float): Offset {
     if (degrees == 0f) return this
@@ -1178,6 +1233,7 @@ internal fun InertiaShape.normalized(bounds: Rect): InertiaShape {
     if (bounds.width <= 0f || bounds.height <= 0f) return this
 
     return InertiaShape(
+        id = id,
         vertices = resolvedVertices().map { vertex ->
             Vertex(
                 position = InertiaPoint(
@@ -1809,6 +1865,15 @@ class InertiaToolHandleTarget(
     val layoutOrigin: Offset,
     val layoutSize: Size,
     val canvasSize: IntSize,
+    /// The transform these handles are drawn inside of, for a shape. Null for an
+    /// actionable — see [InertiaToolHandleGeometry.outer].
+    ///
+    /// A lambda for the same reason [values] is: the actionable a shape sits
+    /// inside of is moving too, and the chrome has to follow it without anything
+    /// republishing this target.
+    val outer: (() -> InertiaOuterTransform)? = null,
+    /// See [InertiaToolHandleGeometry.movesByKnob].
+    val movesByKnob: Boolean = false,
     /// Pointer positions, in the container's coordinate space. The index is the
     /// knob that was grabbed, its place in [InertiaToolHandleGeometry.knobs] —
     /// which is what tells the move tool's two arrows apart.
@@ -1817,7 +1882,9 @@ class InertiaToolHandleTarget(
     val onEnd: () -> Unit
 ) {
     fun geometry(): InertiaToolHandleGeometry =
-        InertiaToolHandleGeometry(tool, values(), layoutOrigin, layoutSize, canvasSize)
+        InertiaToolHandleGeometry(
+            tool, values(), layoutOrigin, layoutSize, canvasSize, outer?.invoke(), movesByKnob
+        )
 }
 
 /// Where every piece of one actionable's chrome sits, for one set of values.
@@ -1826,14 +1893,40 @@ class InertiaToolHandleGeometry(
     val values: InertiaAnimationValues,
     private val layoutOrigin: Offset,
     private val layoutSize: Size,
-    private val canvasSize: IntSize
+    private val canvasSize: IntSize,
+    /// The transform this chrome sits *inside*, and the box it turns about.
+    ///
+    /// Null for an actionable, whose handles sit directly in the container. A
+    /// shape's do not: they are inside the actionable's own animation as well as
+    /// the shape's, so every knob has to be carried out through that second
+    /// transform before it is in the space a pointer reports its position in.
+    private val outer: InertiaOuterTransform? = null,
+    /// Whether the move tool grows a knob at the node's center for dragging it
+    /// freely, on top of its two axis arrows.
+    ///
+    /// A shape's, and only a shape's. An actionable is moved freely by pressing
+    /// its own body — see its pointer input — but a shape's surface is placed
+    /// outside the bounds of the zero-sized node holding it, and Compose does
+    /// not deliver pointer events to a child outside its parent's bounds. The
+    /// same constraint that put every other piece of chrome in this overlay.
+    /// The other two runtimes drag the shape itself and have no knob here.
+    val movesByKnob: Boolean = false
 ) {
     val isDrawable: Boolean
         get() = layoutSize.width > 0f && layoutSize.height > 0f
 
+    /// Every scale this chrome is drawn inside of, so a knob keeps its place
+    /// however the node *and* whatever carries it have been scaled.
+    private val drawnScale: Float
+        get() = values.scale * (outer?.values?.scale ?: 1f)
+
     /// Where a point of the node's own box ends up on screen.
-    fun drawn(local: Offset): Offset =
-        values.drawnPoint(local, layoutOrigin, layoutSize, canvasSize)
+    fun drawn(local: Offset): Offset {
+        val point = values.drawnPoint(local, layoutOrigin, layoutSize, canvasSize)
+        return outer?.let {
+            it.values.drawnContainerPoint(point, it.layoutOrigin, it.layoutSize, canvasSize)
+        } ?: point
+    }
 
     val drawnCenter: Offset
         get() = drawn(Offset(layoutSize.width / 2f, layoutSize.height / 2f))
@@ -1848,8 +1941,12 @@ class InertiaToolHandleGeometry(
     val knobs: List<Offset>
         get() = when (tool) {
             // In the order [InertiaTranslateAxis] declares, which is how a knob
-            // index maps back to the axis it pins a move to.
-            InertiaTool.translate -> InertiaTranslateAxis.entries.map { axisArrowCenter(it) }
+            // index maps back to the axis it pins a move to. The free move comes
+            // after them, so an index past the axes is the one that is free in
+            // both — see [movesByKnob] and [openToolGesture].
+            InertiaTool.translate ->
+                InertiaTranslateAxis.entries.map { axisArrowCenter(it) } +
+                    (if (movesByKnob) listOf(drawnCenter) else emptyList())
             InertiaTool.rotate -> listOf(drawn(rotateKnobLocal))
             InertiaTool.rotateCenter -> listOf(drawn(Offset(layoutSize.width / 2f, -knobGapLocal)))
             InertiaTool.scale -> listOf(
@@ -1871,7 +1968,7 @@ class InertiaToolHandleGeometry(
     /// chrome inside the node and counter-rotate it to arrive at the same place.
     fun axisArrowCenter(axis: InertiaTranslateAxis): Offset {
         val reach = axisGap + axisLength / 2f
-        val half = Size(layoutSize.width * values.scale / 2f, layoutSize.height * values.scale / 2f)
+        val half = Size(layoutSize.width * drawnScale / 2f, layoutSize.height * drawnScale / 2f)
 
         return when (axis) {
             InertiaTranslateAxis.horizontal ->
@@ -1897,7 +1994,7 @@ class InertiaToolHandleGeometry(
     /// out to where the node has been scaled and turned to — which is what keeps
     /// a knob on the corner it belongs to however the node has been transformed.
     private val knobGapLocal: Float
-        get() = if (values.scale > minimumToolScale) knobGap / values.scale else knobGap
+        get() = if (drawnScale > minimumToolScale) knobGap / drawnScale else knobGap
 
     private val rotateKnobLocal: Offset
         get() {
@@ -1912,14 +2009,14 @@ class InertiaToolHandleGeometry(
     /// minimum on screen so a small node still gets something aimable.
     val opacityTrack: Pair<Offset, Offset>
         get() {
-            val localWidth = if (values.scale > minimumToolScale) trackWidth / values.scale else trackWidth
+            val localWidth = if (drawnScale > minimumToolScale) trackWidth / drawnScale else trackWidth
             val y = layoutSize.height + knobGapLocal
             val left = (layoutSize.width - localWidth) / 2f
             return drawn(Offset(left, y)) to drawn(Offset(left + localWidth, y))
         }
 
     val trackWidth: Float
-        get() = maxOf(layoutSize.width * values.scale, 60f)
+        get() = maxOf(layoutSize.width * drawnScale, 60f)
 
     private val opacityKnob: Offset
         get() {
@@ -1950,6 +2047,47 @@ class InertiaToolHandleGeometry(
         const val axisHalfWidth = 7f
     }
 }
+
+/// Everything a shape drawn behind an actionable needs in order to be picked and
+/// dragged, or null when nothing here is selectable.
+///
+/// Nil in a shipped build and whenever the editor has the viewport out of
+/// actionable mode — a shape is then a backdrop and nothing more.
+///
+/// The shapes sit inside their actionable's own transform, so they are handed it
+/// as [outer]: a lambda, because that actionable may be animating and the chrome
+/// has to follow it.
+internal class InertiaShapeEditing(
+    /// Whether this shape is one the editor has picked. Selected by the shape's
+    /// own id, which is what a selection carries — see [InertiaShape.id].
+    val isSelected: (InertiaShape) -> Boolean,
+    /// Which property a gesture on a selected shape authors, as picked in the
+    /// editor's toolbar. The same tool the actionables are edited with: there is
+    /// one palette, and a shape is edited through it exactly as a view is.
+    val tool: InertiaTool,
+    /// The actionable's transform as it is drawn right now, gesture included.
+    /// Read per frame, from the overlay's draw scope, so the chrome follows an
+    /// actionable that is animating.
+    val outerValues: () -> InertiaAnimationValues,
+    /// The actionable's laid-out box in the container's space. Measured rather
+    /// than sampled — `positionInRoot` walks the tree to the root — so it is
+    /// taken when the handles are published and when a gesture opens, never per
+    /// frame. The same bargain the actionable's own handles strike.
+    val outerLayoutBox: () -> Pair<Offset, Size>,
+    /// Where the chrome is published. One target at a time, so an actionable and
+    /// a shape both being selected leaves the handles on whichever published
+    /// last — the hierarchy panel picks one thing at a time.
+    val handles: InertiaToolHandleState?,
+    /// What this shape's handles are owned by, which is what stops one node from
+    /// taking down another's chrome. Instance-scoped, since two instances of a
+    /// card carry two copies of the same shape.
+    val owner: (InertiaShape) -> String,
+    /// What the gesture on this shape has produced so far, held by the actionable
+    /// so it survives the canvas being rebuilt mid-drag.
+    val edit: (InertiaShape) -> InertiaToolEdit,
+    val onChange: (InertiaShape, InertiaToolEdit) -> Unit,
+    val onEnded: (InertiaShape) -> Unit
+)
 
 /// The handle overlay's state, held per [InertiaContainer] and written by the
 /// actionable being edited. The same shape as [InertiaGuideState], and for the
@@ -2009,9 +2147,11 @@ private fun InertiaToolHandlesOverlay(
         val target = state.target
         val knobCount = when (target?.tool) {
             null -> 0
-            // One arrow per axis. The body of the node is still the free move —
-            // see the actionable's own pointer input.
-            InertiaTool.translate -> InertiaTranslateAxis.entries.size
+            // One arrow per axis, and for a shape one more for the free move:
+            // an actionable's own body takes that drag, and a shape's cannot.
+            // See [InertiaToolHandleGeometry.movesByKnob].
+            InertiaTool.translate ->
+                InertiaTranslateAxis.entries.size + (if (target.movesByKnob) 1 else 0)
             InertiaTool.scale -> 4
             else -> 1
         }
@@ -2163,17 +2303,23 @@ private fun InertiaToolHandleChrome(
         }
 
         // The move tool's knobs are the arrowheads drawn above; every other
-        // tool's is a circle sitting where it can be grabbed.
-        if (geometry.tool != InertiaTool.translate) {
-            geometry.knobs.forEach { knob ->
-                drawCircle(color = handleColor, radius = knobRadius, center = knob)
-                drawCircle(
-                    color = Color.White,
-                    radius = knobRadius,
-                    center = knob,
-                    style = Stroke(width = stroke)
-                )
-            }
+        // tool's is a circle sitting where it can be grabbed. The free move is
+        // the exception: it is a knob of the move tool and is drawn as one,
+        // since nothing else marks where a shape can be taken hold of.
+        val circles = if (geometry.tool == InertiaTool.translate) {
+            geometry.knobs.drop(InertiaTranslateAxis.entries.size)
+        } else {
+            geometry.knobs
+        }
+
+        circles.forEach { knob ->
+            drawCircle(color = handleColor, radius = knobRadius, center = knob)
+            drawCircle(
+                color = Color.White,
+                radius = knobRadius,
+                center = knob,
+                style = Stroke(width = stroke)
+            )
         }
 
         geometry.readout?.let { text ->
@@ -2234,15 +2380,15 @@ private fun axisArrowPath(axis: InertiaTranslateAxis, center: Offset): Path {
 private const val knobRadius = 7f
 private const val knobTouchRadius = 28f
 
-/// The handle gesture one actionable has in progress, if any.
-private class InertiaToolGesture {
+/// The handle gesture one node has in progress, if any.
+internal class InertiaToolGesture {
     var start: InertiaToolGestureStart? = null
 }
 
 /// Where a handle gesture opened. Everything here is taken once, at the press,
 /// so the math stays measured against the transform the node had before the
 /// gesture rather than the one the gesture is giving it.
-private class InertiaToolGestureStart(
+internal class InertiaToolGestureStart(
     /// The point the gesture turns or scales about, in the container's space.
     val anchor: Offset,
     /// The axis the arrow this opened on pins a move to, for the move tool. Taken
@@ -2260,10 +2406,120 @@ private class InertiaToolGestureStart(
     /// The node's laid-out box in the container's space. The origin is only the
     /// guides' business, and only while a move is being dragged.
     val layoutOrigin: Offset,
-    val layoutSize: Size
-)
+    val layoutSize: Size,
+    /// The transform the node was sitting inside when the gesture began, for a
+    /// shape. Null for an actionable, which sits inside nothing.
+    val outer: InertiaOuterTransform? = null,
+    /// Whether this opened on the move tool's free knob rather than on one of
+    /// its axis arrows — a move that keeps both components of the drag. See
+    /// [InertiaToolHandleGeometry.movesByKnob].
+    val isFreeMove: Boolean = false
+) {
+    /// Every scale the node was drawn with when the gesture opened — its own,
+    /// and whatever carries it.
+    val drawnScale: Float
+        get() = values.scale * (outer?.values?.scale ?: 1f)
+}
 
 private fun Offset.angleDegrees(): Float = atan2(y, x) * 180f / PI.toFloat()
+
+/// Opens a handle gesture on a node, whatever kind of node it is.
+///
+/// [knobIndex] is the knob that was grabbed, its place in
+/// [InertiaToolHandleGeometry.knobs] — which is what tells the move tool's two
+/// arrows apart.
+internal fun openToolGesture(
+    tool: InertiaTool,
+    knobIndex: Int,
+    position: Offset,
+    values: InertiaAnimationValues,
+    edit: InertiaToolEdit,
+    layoutOrigin: Offset,
+    layoutSize: Size,
+    canvasSize: IntSize,
+    outer: InertiaOuterTransform? = null,
+    movesByKnob: Boolean = false
+): InertiaToolGestureStart {
+    val anchor = InertiaToolHandleGeometry(
+        tool, values, layoutOrigin, layoutSize, canvasSize, outer, movesByKnob
+    ).anchor
+
+    return InertiaToolGestureStart(
+        anchor = anchor,
+        // Which knob was grabbed is which axis it stands for — see
+        // [InertiaToolHandleGeometry.knobs].
+        axis = if (tool == InertiaTool.translate) {
+            InertiaTranslateAxis.entries.getOrNull(knobIndex)
+        } else {
+            null
+        },
+        reference = position - anchor,
+        origin = position,
+        values = values,
+        edit = edit,
+        layoutOrigin = layoutOrigin,
+        layoutSize = layoutSize,
+        outer = outer,
+        isFreeMove = tool == InertiaTool.translate
+            && movesByKnob
+            && knobIndex >= InertiaTranslateAxis.entries.size
+    )
+}
+
+/// The edit this gesture has reached, given where the finger is now.
+///
+/// The one place the five tools are worked out, for the actionables and for the
+/// shapes drawn behind them alike: a shape is edited through the same palette a
+/// view is, so it is edited by the same math. Mirrors the same five cases in the
+/// SwiftUI and React runtimes.
+internal fun InertiaToolGestureStart.editAt(tool: InertiaTool, position: Offset): InertiaToolEdit {
+    val current = position - anchor
+
+    return when (tool) {
+        InertiaTool.translate -> {
+            // The same move the body of the node takes, with the axis the arrow
+            // stands for the only one it is allowed to author. An arrow with no
+            // axis behind it moves nothing rather than moving freely — a press
+            // that cannot be attributed is not a move anyone asked for.
+            //
+            // Constrained on screen, where the arrows are, and carried into the
+            // space the node's own offset lands in afterwards.
+            val delta = position - origin
+            val constrained = if (isFreeMove) delta else axis?.constrain(delta) ?: Offset.Zero
+            edit.copy(translate = edit.translate + (outer?.values?.unapplying(constrained) ?: constrained))
+        }
+
+        InertiaTool.rotate, InertiaTool.rotateCenter -> {
+            val swept = current.angleDegrees() - reference.angleDegrees()
+            if (tool == InertiaTool.rotate) {
+                edit.copy(rotate = edit.rotate + swept)
+            } else {
+                edit.copy(rotateCenter = edit.rotateCenter + swept)
+            }
+        }
+
+        InertiaTool.scale -> {
+            val referenceLength = reference.getDistance()
+            if (referenceLength > 1f) {
+                val factor = current.getDistance() / referenceLength
+                val scaled = maxOf(minimumToolScale, values.scale * factor)
+                edit.copy(scale = edit.scale + (scaled - values.scale))
+            } else {
+                edit
+            }
+        }
+
+        InertiaTool.opacity -> {
+            // Measured along the track from where the gesture opened, so the
+            // knob tracks the finger instead of jumping to it. The track as it
+            // is drawn, which is the node's box through every scale above it.
+            val width = maxOf(layoutSize.width * drawnScale, 60f)
+            val travelled = (position.x - origin.x) / width
+            val settled = (values.opacity + travelled).coerceIn(0f, 1f)
+            edit.copy(opacity = edit.opacity + (settled - values.opacity))
+        }
+    }
+}
 
 /// What the alignment guides for one actionable are drawn from.
 ///
@@ -2603,6 +2859,12 @@ fun Inertia(
     /// relative to its own start, so without carrying this every gesture after
     /// the first would snap the node back to where its schema puts it.
     var edit by remember { mutableStateOf(InertiaToolEdit()) }
+    /// The same, for each shape drawn behind this node, by the shape's own id.
+    ///
+    /// Held here rather than in the canvas that draws the shape, so a gesture
+    /// survives that canvas being rebuilt under it — which is what happens on
+    /// every frame the shape is dragged.
+    val shapeEdits = remember { mutableStateMapOf<String, InertiaToolEdit>() }
     /// This node's laid-out size. The shapes behind it are measured in multiples
     /// of it, and nothing else about where it sits matters to them — the canvas
     /// is a child of this node, so it travels with it.
@@ -2662,6 +2924,16 @@ fun Inertia(
     // snapping the node out from under the finger.
     LaunchedEffect(animation?.initialValues) {
         edit = InertiaToolEdit()
+    }
+
+    // And the shapes' drags, for the same reason: a shape's gesture comes back
+    // as a track on that shape, and the edit that authored it has to go once it
+    // has. Keyed on the tracks themselves rather than on the model instance, so
+    // a selection does not drop a drag the editor has not been told about yet.
+    // One shape's track landing clears them all, which costs nothing: only one
+    // shape is ever being dragged, and its own edit is the one going stale.
+    LaunchedEffect(shapes.map { it.animation?.initialValues }) {
+        shapeEdits.clear()
     }
 
     // An animation starts as soon as the runtime holds its schema, or waits for
@@ -2835,6 +3107,33 @@ fun Inertia(
         }
     }
 
+    /// Ends a gesture on a shape drawn behind this node and hands the result to
+    /// the editor.
+    ///
+    /// The same [MessageEdit] this node sends for itself, naming the shape's own
+    /// id under the schema that carries it — which is exactly how it was
+    /// selected. Measured from the shape's own authored starting values rather
+    /// than from wherever its track has it, for the reason [commitEdit] gives.
+    val commitShapeEdit = { shape: InertiaShape ->
+        if (currentCanvasSize != IntSize.Zero) {
+            val settled = shapeEdits[shape.id] ?: InertiaToolEdit()
+            val base = shape.animation?.initialValues?.sanitized() ?: InertiaAnimationValues()
+
+            WebSocketClient.shared.sendMessageEdit(
+                MessageEdit(
+                    tool = currentTool,
+                    values = base.applying(settled, currentCanvasSize),
+                    actionableIds = setOf(
+                        ActionableIdPair(
+                            hierarchyIdPrefix = hierarchyIdPrefix,
+                            hierarchyId = shape.id
+                        )
+                    )
+                )
+            )
+        }
+    }
+
     /// This node's laid-out box in the container's space, measured on demand.
     /// `positionInRoot` walks the tree to the root, so this is called when a
     /// gesture opens and when the handles are republished, not per layout pass.
@@ -2852,76 +3151,22 @@ fun Inertia(
 
     val beginHandleGesture = { index: Int, position: Offset ->
         val (origin, size) = measureLayoutBox()
-        val values = sample()
-        val anchor = InertiaToolHandleGeometry(currentTool, values, origin, size, canvasSize).anchor
 
-        handleGesture.start = InertiaToolGestureStart(
-            anchor = anchor,
-            // Which knob was grabbed is which axis it stands for — see
-            // [InertiaToolHandleGeometry.knobs].
-            axis = if (currentTool == InertiaTool.translate) {
-                InertiaTranslateAxis.entries.getOrNull(index)
-            } else {
-                null
-            },
-            reference = position - anchor,
-            origin = position,
-            values = values,
+        handleGesture.start = openToolGesture(
+            tool = currentTool,
+            knobIndex = index,
+            position = position,
+            values = sample(),
             edit = edit,
             layoutOrigin = origin,
-            layoutSize = size
+            layoutSize = size,
+            canvasSize = canvasSize
         )
     }
 
-    /// The edit the gesture has reached, given where the finger is now. Mirrors
-    /// the same five cases in the SwiftUI and React runtimes.
     val dragHandleGesture = { position: Offset ->
         handleGesture.start?.let { opening ->
-            val current = position - opening.anchor
-
-            val next = when (tool) {
-                InertiaTool.translate -> {
-                    // The same move the body of the node takes, with the axis the
-                    // arrow stands for the only one it is allowed to author. An
-                    // arrow with no axis behind it moves nothing rather than
-                    // moving freely — a press that cannot be attributed is not a
-                    // move anyone asked for.
-                    val delta = position - opening.origin
-                    val constrained = opening.axis?.constrain(delta) ?: Offset.Zero
-                    opening.edit.copy(translate = opening.edit.translate + constrained)
-                }
-
-                InertiaTool.rotate, InertiaTool.rotateCenter -> {
-                    val swept = current.angleDegrees() - opening.reference.angleDegrees()
-                    if (tool == InertiaTool.rotate) {
-                        opening.edit.copy(rotate = opening.edit.rotate + swept)
-                    } else {
-                        opening.edit.copy(rotateCenter = opening.edit.rotateCenter + swept)
-                    }
-                }
-
-                InertiaTool.scale -> {
-                    val reference = opening.reference.getDistance()
-                    if (reference > 1f) {
-                        val factor = current.getDistance() / reference
-                        val scaled = maxOf(minimumToolScale, opening.values.scale * factor)
-                        opening.edit.copy(scale = opening.edit.scale + (scaled - opening.values.scale))
-                    } else {
-                        opening.edit
-                    }
-                }
-
-                InertiaTool.opacity -> {
-                    // Measured along the track from where the gesture opened, so
-                    // the knob tracks the finger instead of jumping to it.
-                    val width = maxOf(opening.layoutSize.width * opening.values.scale, 60f)
-                    val travelled = (position.x - opening.origin.x) / width
-                    val settled = (opening.values.opacity + travelled).coerceIn(0f, 1f)
-                    opening.edit.copy(opacity = opening.edit.opacity + (settled - opening.values.opacity))
-                }
-            }
-
-            applyEdit(next)
+            applyEdit(opening.editAt(tool, position))
 
             // The guides box a node in as it is moved, whichever handle is doing
             // the moving — the same ones the body drag puts up. They mean nothing
@@ -3118,6 +3363,30 @@ fun Inertia(
         Modifier
     }
 
+    /// Everything a shape drawn behind this node needs in order to be picked and
+    /// dragged, or null when nothing here is selectable.
+    ///
+    /// Not gated on this node's own selection: a shape is picked in the editor's
+    /// hierarchy panel, and picking one does not pick the view it was authored
+    /// behind.
+    val shapeEditing = if (model?.isActionable == true && instanceId != null) {
+        InertiaShapeEditing(
+            isSelected = { shape ->
+                currentModel?.actionableIds?.any { it.hierarchyId == shape.id } == true
+            },
+            tool = tool,
+            outerValues = sample,
+            outerLayoutBox = measureLayoutBox,
+            handles = handles,
+            owner = { shape -> "$instanceId--${shape.id}" },
+            edit = { shape -> shapeEdits[shape.id] ?: InertiaToolEdit() },
+            onChange = { shape, next -> shapeEdits[shape.id] = next },
+            onEnded = commitShapeEdit
+        )
+    } else {
+        null
+    }
+
     Box(
         modifier = Modifier
             // Ahead of the animation layer and the drag offset, so these are the
@@ -3147,19 +3416,29 @@ fun Inertia(
         // The drawn ones come after, in the order they were authored — shapes
         // have no z-index of their own, and the file's order is the only
         // ordering anyone has expressed.
+        //
+        // Being selected puts a shape on a canvas of its own too: the border and
+        // the handles are fitted to one shape's box, and a shape sharing a
+        // canvas has no box of its own to fit them to. The same split the Swift
+        // runtime makes in `isDrawnAlone`.
         if (shapes.isNotEmpty() && layoutSize != IntSize.Zero) {
-            val backdrop = shapes.filter { it.animation == null }
+            val isDrawnAlone = { shape: InertiaShape ->
+                shape.animation != null || shapeEditing?.isSelected(shape) == true
+            }
+
+            val backdrop = shapes.filterNot(isDrawnAlone)
             if (backdrop.isNotEmpty()) {
                 InertiaShapeCanvas(shapes = backdrop, actionableSize = layoutSize)
             }
 
-            shapes.filter { it.animation != null }.forEach { shape ->
+            shapes.filter(isDrawnAlone).forEach { shape ->
                 InertiaShapeCanvas(
                     shapes = listOf(shape),
                     actionableSize = layoutSize,
                     animation = shape.animation,
                     hierarchyIdPrefix = hierarchyIdPrefix,
-                    containerSize = canvasSize
+                    containerSize = canvasSize,
+                    editing = shapeEditing
                 )
             }
         }
