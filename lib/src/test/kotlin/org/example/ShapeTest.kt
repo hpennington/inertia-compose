@@ -1,6 +1,8 @@
 package org.inertiagraphics.inertia
 
 import androidx.compose.ui.geometry.Rect
+import kotlin.math.pow
+import kotlin.math.sqrt
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
@@ -186,7 +188,8 @@ class ShapeTest {
                         id = "123",
                         type = InertiaShapeType.rectangle,
                         width = 2f,
-                        height = 2f
+                        height = 2f,
+                        color = InertiaColor(red = 1f, green = 0f, blue = 0f, alpha = 1f)
                     ),
                     animation = InertiaAnimationSchema(
                         id = "shape0",
@@ -242,5 +245,104 @@ class ShapeTest {
 
         assertEquals("shape0", normalized.animation?.id)
         assertEquals(shape.resolvedVertices().size, normalized.vertices.size)
+    }
+
+    // MARK: - The vectors a description resolves to
+
+    /// A vector described rather than spelled out, in whatever box it was
+    /// dragged out over.
+    private fun described(
+        type: InertiaShapeType,
+        width: Float,
+        height: Float,
+        color: InertiaColor = InertiaColor(red = 1f, green = 0f, blue = 0f, alpha = 1f)
+    ) = InertiaShape(
+        shape = InertiaShapeProperties(id = "123", type = type, width = width, height = height, color = color)
+    )
+
+    /// The two descriptions that carry two measurements have to spend both. A
+    /// rectangle sized by one of them is the bug this replaced: every vector
+    /// came out square, whatever box it had been dragged out over.
+    @Test
+    fun `rectangle and oval fill the box they were drawn in`() {
+        for (type in listOf(InertiaShapeType.rectangle, InertiaShapeType.oval)) {
+            val bounds = assertNotNull(listOf(described(type, 3f, 1f)).bounds())
+
+            assertEquals(3f, bounds.width, tolerance, "$type")
+            assertEquals(1f, bounds.height, tolerance, "$type")
+        }
+    }
+
+    /// The three descriptions with one measurement rather than two stay
+    /// themselves whatever box they were drawn in — sized, all three, by its
+    /// longer side. The triangle is the one that isn't as tall as it is wide: it
+    /// is drawn equilateral, so its height is the altitude of its base.
+    @Test
+    fun `square circle and triangle stay regular in a lopsided box`() {
+        val heights = mapOf(
+            InertiaShapeType.square to 3f,
+            InertiaShapeType.circle to 3f,
+            InertiaShapeType.triangle to 3f * sqrt(3f) / 2f
+        )
+
+        for ((type, height) in heights) {
+            val bounds = assertNotNull(listOf(described(type, 3f, 1f)).bounds())
+
+            assertEquals(3f, bounds.width, tolerance, "$type")
+            assertEquals(height, bounds.height, tolerance, "$type")
+        }
+    }
+
+    /// A round vector is drawn as the many-sided polygon that reads as one, and
+    /// every one of those corners sits on the ellipse — which is what stops it
+    /// being the squared-off box it used to be drawn as.
+    @Test
+    fun `oval is a ring of corners on its ellipse`() {
+        val shape = described(InertiaShapeType.oval, 4f, 2f)
+        val vertices = shape.resolvedVertices()
+
+        assertEquals(ovalSegments, vertices.size)
+
+        for (vertex in vertices) {
+            // x²/a² + y²/b² = 1, for a ring centred on the origin the
+            // description is measured from.
+            val position = vertex.position
+            assertEquals(1f, (position.x / 2f).pow(2) + (position.y / 1f).pow(2), tolerance)
+        }
+
+        // The ring is convex, so the fan the renderer draws covers it exactly:
+        // one triangle per corner but the two the fan turns about.
+        assertEquals((ovalSegments - 2) * 3, shape.triangles().size)
+    }
+
+    /// Every vector the editor can author has to survive the wire, not just the
+    /// one the rest of these tests happen to use. A case this runtime does not
+    /// know is not a shape that comes out wrong — it is a file that fails to
+    /// decode, taking the whole container's schemas down with it.
+    @Test
+    fun `every vector type decodes off the wire`() {
+        val shapes = InertiaShapeType.entries.map { described(it, 3f, 1f) }
+        val card = InertiaAnimationSchema(id = "card0", invokeType = InertiaAnimationInvokeType.auto, shapes = shapes)
+
+        val bytes = inertiaMsgPack.encodeToByteArray(listOf(card))
+        val decoded = inertiaMsgPack.decodeFromByteArray<List<InertiaAnimationSchema>>(bytes).first()
+
+        assertEquals(InertiaShapeType.entries.size, decoded.shapes.size)
+        for ((index, type) in InertiaShapeType.entries.withIndex()) {
+            assertEquals(type, decoded.shapes[index].shape?.type)
+            assertNotNull(listOf(decoded.shapes[index]).bounds(), "$type")
+        }
+    }
+
+    /// The colour the description carries is the colour the corners come out,
+    /// rather than the red placeholder every described vector used to be drawn
+    /// in whatever the editor had recorded against it.
+    @Test
+    fun `described shape is drawn in its own color`() {
+        val color = InertiaColor(red = 0.25f, green = 0.5f, blue = 0.75f, alpha = 0.5f)
+
+        val corner = described(InertiaShapeType.rectangle, 1f, 1f, color).resolvedVertices().first()
+
+        assertEquals(color, corner.color)
     }
 }
