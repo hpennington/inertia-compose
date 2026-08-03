@@ -193,8 +193,27 @@ data class InertiaAnimationSchema(
     /// What the actionable's canvas draws behind it. Defaulted, so an animation
     /// recorded before shapes existed — or one that simply wants none — still
     /// decodes.
-    val shapes: List<InertiaShape> = emptyList()
+    val shapes: List<InertiaShape> = emptyList(),
+    /// How long one loop of the timeline this was authored on lasts.
+    ///
+    /// A property of the animation rather than of the editor that recorded it:
+    /// a track is padded out to the loop, so an animation played back at a
+    /// length other than the one it was drawn against holds — or truncates —
+    /// where its author did not mean it to. Every schema in a project carries
+    /// the same value, which is what the editor's one timeline slider writes.
+    ///
+    /// Defaulted, so an animation recorded before the loop was part of the
+    /// schema — or one happy with the default — still decodes.
+    val loopDuration: Float = InertiaPlayback.defaultLoopDuration
 )
+
+/// The loop these schemas were authored against, or null if none of them say.
+///
+/// The longest, where a hand-edited file disagrees with itself: the loop is what
+/// every track is padded out to, and the shorter answer would cut the track that
+/// asked for more off at the knees.
+internal fun authoredLoopDuration(schemas: Collection<InertiaAnimationSchema>): Float? =
+    schemas.map { InertiaPlayback.clampLoopDuration(it.loopDuration) }.maxOrNull()
 
 @Serializable
 data class InertiaPoint(val x: Float, val y: Float)
@@ -1316,9 +1335,13 @@ class InertiaPlaybackController internal constructor() {
     /// lengths matter here — an actionable samples its own track.
     private var schemas by mutableStateOf<Map<String, InertiaAnimationSchema>>(emptyMap())
 
-    /// How long one loop lasts, as set on the editor's timeline. Read each frame,
-    /// so resizing the timeline mid-run stretches the loop rather than waiting
-    /// for it to be restarted.
+    /// How long one loop lasts.
+    ///
+    /// Seeded from the schemas — the loop is part of what was authored, so a
+    /// shipped build loops over the span its animation was drawn against without
+    /// anything having to tell it — and moved from there by the editor's
+    /// timeline. Read each frame, so resizing the timeline mid-run stretches the
+    /// loop rather than waiting for it to be restarted.
     var loopDuration: Float by mutableFloatStateOf(InertiaPlayback.defaultLoopDuration)
 
     /// How far into the run currently on screen we are, in seconds.
@@ -1436,6 +1459,13 @@ class InertiaPlaybackController internal constructor() {
     /// it away from whoever is scrubbing.
     internal fun setSchemas(schemas: Map<String, InertiaAnimationSchema>) {
         this.schemas = schemas
+
+        // The loop travels with the schemas, so a project authored at a length
+        // other than the default plays at it from the first send — and in a
+        // shipped build, where no editor is ever going to say otherwise. An
+        // empty set leaves the current loop alone rather than snapping back to
+        // the default.
+        authoredLoopDuration(schemas.values)?.let { loopDuration = it }
 
         if (seekTime == null && hasTriggeredActionable) startClock()
     }
