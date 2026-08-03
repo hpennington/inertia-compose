@@ -1,12 +1,14 @@
 package org.inertiagraphics.inertia
 
 import androidx.compose.ui.geometry.Rect
+import kotlin.math.abs
 import kotlin.math.pow
 import kotlin.math.sqrt
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromByteArray
 import kotlinx.serialization.encodeToByteArray
@@ -88,16 +90,19 @@ class ShapeTest {
     }
 
     /// Normalizing restates a shape in its canvas's own space, which is about
-    /// where it is drawn and not about what it is. A shape that came out the
-    /// other side unnamed would be drawn and then unselectable.
+    /// where it is drawn and not about what it is — so every corner of the
+    /// drawing comes through it, and only their positions change.
     @Test
-    fun `normalizing keeps the shape's id`() {
+    fun `normalizing keeps everything the shape draws`() {
         val shape = InertiaShape(
             id = "named",
             vertices = listOf(corner(0f, 0f), corner(2f, 0f), corner(2f, 2f))
         )
 
-        assertEquals("named", shape.normalized(Rect(0f, 0f, 2f, 2f)).id)
+        val normalized = shape.normalizedTriangles(Rect(0f, 0f, 2f, 2f))
+
+        assertEquals(shape.triangles().size, normalized.size)
+        assertEquals(shape.triangles().map { it.color }, normalized.map { it.color })
     }
 
     /// An animation authored before shapes existed — or one that simply wants
@@ -187,11 +192,11 @@ class ShapeTest {
             vertices = listOf(corner(-0.5f, 0f), corner(1.5f, 0f), corner(1.5f, 2f))
         )
 
-        val normalized = shape.normalized(Rect(left = -0.5f, top = 0f, right = 1.5f, bottom = 2f))
+        val normalized = shape.normalizedTriangles(Rect(left = -0.5f, top = 0f, right = 1.5f, bottom = 2f))
 
-        assertEquals(InertiaPoint(0f, 0f), normalized.vertices[0].position)
-        assertEquals(InertiaPoint(1f, 0f), normalized.vertices[1].position)
-        assertEquals(InertiaPoint(1f, 1f), normalized.vertices[2].position)
+        assertEquals(InertiaPoint(0f, 0f), normalized[0].position)
+        assertEquals(InertiaPoint(1f, 0f), normalized[1].position)
+        assertEquals(InertiaPoint(1f, 1f), normalized[2].position)
     }
 
     /// Fewer than three corners enclose nothing, and handing the renderer a
@@ -224,7 +229,7 @@ class ShapeTest {
                         type = InertiaShapeType.rectangle,
                         width = 2f,
                         height = 2f,
-                        color = InertiaColor(red = 1f, green = 0f, blue = 0f, alpha = 1f)
+                        fill = InertiaColor(red = 1f, green = 0f, blue = 0f, alpha = 1f)
                     ),
                     animation = InertiaAnimationSchema(
                         id = "shape0",
@@ -256,30 +261,33 @@ class ShapeTest {
     }
 
     /// A described shape has no corners on the wire; the ones it is drawn from
-    /// are worked out from the description. A rectangle is the two triangles of
-    /// a quad, so it reaches the renderer as six corners.
+    /// are worked out from the description. A rectangle is its four corners, and
+    /// the fan that covers them is the two triangles of a quad.
     @Test
     fun `described shape is drawn from its description`() {
         val shape = drawnShape()
 
         assertEquals(emptyList(), shape.vertices)
-        assertEquals(6, shape.resolvedVertices().size)
+        assertEquals(4, shape.resolvedVertices().size)
+        assertEquals(6, shape.triangles().size)
         assertNotNull(listOf(shape).bounds())
     }
 
-    /// Normalizing is about where a shape lands on the canvas, not about what it
-    /// then does — so the track has to come through it. It is the last thing to
-    /// touch a shape before the renderer, and a shape that lost its animation
-    /// here would be drawn in the right place and never move.
+    /// Normalizing is the last thing to touch a shape before the renderer, and
+    /// what it hands over is the drawing rather than the outline — so everything
+    /// the shape paints has to come through it, at the size the canvas is.
     @Test
-    fun `normalizing keeps the shapes animation`() {
+    fun `normalizing hands over the whole drawing`() {
         val shape = drawnShape()
         val bounds = assertNotNull(listOf(shape).bounds())
 
-        val normalized = shape.normalized(bounds)
+        val normalized = shape.normalizedTriangles(bounds)
 
-        assertEquals("shape0", normalized.animation?.id)
-        assertEquals(shape.resolvedVertices().size, normalized.vertices.size)
+        assertEquals(shape.triangles().size, normalized.size)
+        // The shape filled its own bounds, so normalizing lands it on the unit
+        // box: the far corners exactly on it.
+        assertEquals(0f, normalized.minOf { it.position.x }, tolerance)
+        assertEquals(1f, normalized.maxOf { it.position.x }, tolerance)
     }
 
     // MARK: - The vectors a description resolves to
@@ -290,10 +298,20 @@ class ShapeTest {
         type: InertiaShapeType,
         width: Float,
         height: Float,
-        color: InertiaColor = InertiaColor(red = 1f, green = 0f, blue = 0f, alpha = 1f)
+        fill: InertiaColor? = InertiaColor(red = 1f, green = 0f, blue = 0f, alpha = 1f),
+        stroke: InertiaColor? = null,
+        strokeWidth: Float = 0f
     ) = InertiaShape(
         id = "described",
-        shape = InertiaShapeProperties(id = "123", type = type, width = width, height = height, color = color)
+        shape = InertiaShapeProperties(
+            id = "123",
+            type = type,
+            width = width,
+            height = height,
+            fill = fill,
+            stroke = stroke,
+            strokeWidth = strokeWidth
+        )
     )
 
     /// The two descriptions that carry two measurements have to spend both. A
@@ -380,5 +398,103 @@ class ShapeTest {
         val corner = described(InertiaShapeType.rectangle, 1f, 1f, color).resolvedVertices().first()
 
         assertEquals(color, corner.color)
+    }
+
+    // MARK: - Filling and stroking a described vector
+
+    private val blue = InertiaColor(red = 0f, green = 0f, blue = 1f, alpha = 1f)
+    private val red = InertiaColor(red = 1f, green = 0f, blue = 0f, alpha = 1f)
+
+    /// The two halves of painting a vector are independent: either alone is a
+    /// shape, and neither drags the other along with it. Drawn fill first, so
+    /// the outline lands on top of the area it encloses.
+    @Test
+    fun `fill and stroke are drawn independently`() {
+        val filled = described(InertiaShapeType.rectangle, 2f, 2f, fill = red)
+        val stroked = described(InertiaShapeType.rectangle, 2f, 2f, fill = null, stroke = blue, strokeWidth = 0.1f)
+        val both = described(InertiaShapeType.rectangle, 2f, 2f, fill = red, stroke = blue, strokeWidth = 0.1f)
+
+        assertTrue(filled.triangles().all { it.color == red })
+        assertTrue(stroked.triangles().all { it.color == blue })
+        assertEquals(filled.triangles().size + stroked.triangles().size, both.triangles().size)
+        assertEquals(filled.triangles().map { it.color }, both.triangles().take(filled.triangles().size).map { it.color })
+    }
+
+    /// A shape with neither draws nothing, which is the one combination there is
+    /// no reason to author — and a stroke colour with no width, or a width with
+    /// no colour, is each half of an outline that was never asked for.
+    @Test
+    fun `shape with nothing to paint with draws nothing`() {
+        assertEquals(emptyList(), described(InertiaShapeType.rectangle, 2f, 2f, fill = null).triangles())
+        assertEquals(emptyList(), described(InertiaShapeType.rectangle, 2f, 2f, fill = null, stroke = blue).triangles())
+        assertEquals(emptyList(), described(InertiaShapeType.rectangle, 2f, 2f, fill = null, strokeWidth = 0.1f).triangles())
+    }
+
+    /// The stroke is drawn inside the outline, so a shape occupies the box it
+    /// was authored at whether or not it is stroked: adding an outline never
+    /// moves the shape or grows the canvas fitted to it.
+    @Test
+    fun `stroke is drawn inside the shapes own box`() {
+        val plain = assertNotNull(listOf(described(InertiaShapeType.rectangle, 2f, 2f, fill = red)).bounds())
+        val thick = assertNotNull(
+            listOf(described(InertiaShapeType.rectangle, 2f, 2f, fill = red, stroke = blue, strokeWidth = 0.4f)).bounds()
+        )
+
+        assertEquals(plain, thick)
+    }
+
+    /// The band is an even thickness all the way round, corners included: the
+    /// inner ring of a stroked square is the square inset by the stroke on every
+    /// side, which is what the mitre at each corner is for.
+    @Test
+    fun `stroke is an even thickness around the shape`() {
+        val stroked = described(InertiaShapeType.square, 2f, 2f, fill = null, stroke = blue, strokeWidth = 0.25f)
+
+        // The outline runs ±1 from the centre; the inside of the band ±0.75.
+        val inner = stroked.triangles().filter { abs(it.position.x) < 0.9999f && abs(it.position.y) < 0.9999f }
+        assertTrue(inner.isNotEmpty())
+
+        for (vertex in inner) {
+            assertEquals(0.75f, maxOf(abs(vertex.position.x), abs(vertex.position.y)), tolerance)
+        }
+    }
+
+    /// A stroke thicker than the shape has room for would turn the inner ring
+    /// inside out — corners crossing past each other and the band folding back
+    /// through itself. Held where the ring closes, which is a solid shape.
+    @Test
+    fun `stroke thicker than the shape is drawn solid`() {
+        val overstroked = described(InertiaShapeType.square, 2f, 2f, fill = null, stroke = blue, strokeWidth = 10f)
+
+        for (vertex in overstroked.triangles()) {
+            assertTrue(abs(vertex.position.x) <= 1.0001f)
+            assertTrue(abs(vertex.position.y) <= 1.0001f)
+        }
+    }
+
+    /// Every described vector can be stroked, not just the ones with corners: a
+    /// round one is stroked around all 48 of the segments it is cut into, and a
+    /// triangle around its three sharp corners.
+    @Test
+    fun `every described vector can be stroked`() {
+        for (type in InertiaShapeType.entries) {
+            val stroked = described(type, 3f, 1f, fill = null, stroke = blue, strokeWidth = 0.1f)
+
+            // Two triangles per edge of the outline, and the outline closes.
+            assertEquals(stroked.resolvedVertices().size * 6, stroked.triangles().size, "$type")
+        }
+    }
+
+    /// One authored vector is the same drawing on every runtime, stroke and all:
+    /// the Swift and WebGL runtimes cut the same ring into the same band.
+    @Test
+    fun `stroked square matches the other runtimes corner for corner`() {
+        val stroked = described(InertiaShapeType.square, 2f, 2f, fill = null, stroke = blue, strokeWidth = 0.25f)
+        val triangles = stroked.triangles()
+
+        assertEquals(24, triangles.size)
+        assertEquals(InertiaPoint(-1f, -1f), triangles[0].position)
+        assertEquals(InertiaPoint(1f, -1f), triangles[1].position)
+        assertEquals(InertiaPoint(0.75f, -0.75f), triangles[2].position)
     }
 }

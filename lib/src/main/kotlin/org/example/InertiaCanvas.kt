@@ -301,7 +301,7 @@ private fun FloatArray.toFloatBuffer(): FloatBuffer =
 /// Every shape restated in the canvas's own space and flattened into the one
 /// triangle list the GPU draws.
 internal fun List<InertiaShape>.vertexData(bounds: Rect): FloatArray {
-    val vertices = flatMap { it.normalized(bounds).triangles() }
+    val vertices = flatMap { it.normalizedTriangles(bounds) }
     val data = FloatArray(vertices.size * FLOATS_PER_VERTEX)
 
     vertices.forEachIndexed { index, vertex ->

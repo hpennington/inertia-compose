@@ -236,16 +236,42 @@ data class Vertex(val position: InertiaPoint, val color: InertiaColor)
 @Serializable
 enum class InertiaShapeType { rectangle, square, circle, oval, triangle }
 
-/// A drawn vector as the editor records it: what it is, how big, and what colour
-/// — the size in the same multiples of the actionable its corners would have
-/// been measured in.
+/// A drawn vector as the editor records it: what it is, how big, and how it is
+/// painted — the size in the same multiples of the actionable its corners would
+/// have been measured in.
+///
+/// Painting is the two halves a vector has always had everywhere else: [fill]
+/// floods the area the outline encloses, [stroke] draws the outline itself, and
+/// either may be left out. A shape with no fill is an outline on nothing; a
+/// shape with no stroke is the flat area a described vector used to be; a shape
+/// with neither draws nothing at all, which is the one combination there is no
+/// reason to author.
 @Serializable
 data class InertiaShapeProperties(
     val id: String,
     val type: InertiaShapeType,
     val width: Float,
     val height: Float,
-    val color: InertiaColor
+
+    /// The colour flooding the outline, or null for a shape that is only its
+    /// outline.
+    val fill: InertiaColor? = null,
+
+    /// The colour of the outline itself, or null for a shape that is only its
+    /// area. Draws nothing without a [strokeWidth] to draw it at.
+    val stroke: InertiaColor? = null,
+
+    /// How thick the outline is, in the units the shape is sized in — multiples
+    /// of the actionable's own frame, the same as [width] and [height], so a
+    /// stroke keeps its weight relative to the shape at every size that frame
+    /// takes.
+    ///
+    /// The stroke is drawn *inside* the outline: a shape occupies exactly the
+    /// box it was authored at whether or not it is stroked, so adding a stroke
+    /// never moves the shape or grows the canvas it is drawn on. A width past
+    /// half the shape's smaller side would turn the ring inside out, so it is
+    /// held there — a stroke that thick is a solid shape, and is drawn as one.
+    val strokeWidth: Float = 0f
 )
 
 /// A shape as it is authored alongside an animation: a ring of corners, each
@@ -1116,41 +1142,37 @@ internal const val ovalSegments = 48
 /// measured from.
 ///
 /// Matches the Swift and WebGL runtimes corner for corner, so one authored
-/// vector is the same drawing on all three. A rectangle comes out as the two
-/// triangles of a quad rather than four corners; the fan in [triangles]
-/// re-covers the same area from them.
+/// vector is the same drawing on all three.
 ///
 /// A square, a circle and a triangle are the descriptions with one measurement
 /// rather than two, so each is sized by the longer side of the box it was drawn
 /// in — the shape stays square, stays round, stays a triangle whatever box it
 /// was dragged out over.
-private fun InertiaShapeProperties.describedVertices(): List<Vertex> {
+internal fun InertiaShapeProperties.outline(): List<InertiaPoint> {
     val size = maxOf(width, height)
-    fun corner(x: Float, y: Float) = Vertex(InertiaPoint(x, y), color)
 
     /// The ring inscribed in a box: one corner per segment, stepping around the
-    /// ellipse. The ring is convex, so the fan the renderer draws it with covers
-    /// it exactly.
-    fun ring(width: Float, height: Float): List<Vertex> {
+    /// ellipse.
+    fun ring(width: Float, height: Float): List<InertiaPoint> {
         val radiusX = width / 2f
         val radiusY = height / 2f
 
         return (0 until ovalSegments).map { segment ->
             val angle = 2.0 * PI * segment / ovalSegments
-            corner(radiusX * cos(angle).toFloat(), radiusY * sin(angle).toFloat())
+            InertiaPoint(radiusX * cos(angle).toFloat(), radiusY * sin(angle).toFloat())
         }
     }
 
-    /// The two triangles of a quad, which is how a rectangle reaches the
-    /// renderer.
-    fun quad(width: Float, height: Float): List<Vertex> {
+    /// The four corners of a box, drawn about its centre.
+    fun quad(width: Float, height: Float): List<InertiaPoint> {
         val halfWidth = width / 2f
         val halfHeight = height / 2f
-        val topLeft = corner(-halfWidth, -halfHeight)
-        val topRight = corner(halfWidth, -halfHeight)
-        val bottomLeft = corner(-halfWidth, halfHeight)
-        val bottomRight = corner(halfWidth, halfHeight)
-        return listOf(topLeft, topRight, bottomRight, topLeft, bottomLeft, bottomRight)
+        return listOf(
+            InertiaPoint(-halfWidth, -halfHeight),
+            InertiaPoint(halfWidth, -halfHeight),
+            InertiaPoint(halfWidth, halfHeight),
+            InertiaPoint(-halfWidth, halfHeight)
+        )
     }
 
     return when (type) {
@@ -1159,12 +1181,13 @@ private fun InertiaShapeProperties.describedVertices(): List<Vertex> {
         InertiaShapeType.circle -> ring(size, size)
         InertiaShapeType.oval -> ring(width, height)
         InertiaShapeType.triangle -> {
+            // An isosceles triangle with mirror symmetry about the y-axis.
             val triangleHeight = size * sqrt(3f) / 2f
             val halfBase = size / 2f
             listOf(
-                corner(0f, triangleHeight / 2f),
-                corner(-halfBase, -triangleHeight / 2f),
-                corner(halfBase, -triangleHeight / 2f)
+                InertiaPoint(0f, triangleHeight / 2f),
+                InertiaPoint(-halfBase, -triangleHeight / 2f),
+                InertiaPoint(halfBase, -triangleHeight / 2f)
             )
         }
     }
@@ -1172,19 +1195,126 @@ private fun InertiaShapeProperties.describedVertices(): List<Vertex> {
 
 /// The corners this shape is drawn from, however it was authored: the ones
 /// recorded against it, or the ones its description resolves to.
-internal fun InertiaShape.resolvedVertices(): List<Vertex> =
-    if (vertices.isNotEmpty()) vertices else shape?.describedVertices() ?: emptyList()
+///
+/// A described vector resolves to its outline carrying the colour it is filled
+/// with — or, for a shape that is only its outline, the colour it is stroked
+/// with, so an unfilled shape still says where it is to everything that measures
+/// a shape by its corners.
+internal fun InertiaShape.resolvedVertices(): List<Vertex> {
+    if (vertices.isNotEmpty()) return vertices
+    val shape = shape ?: return emptyList()
 
-/// The shape as the triangle list the GPU draws: a fan around the first corner,
-/// so three corners are a triangle and four a quad. Fewer than three enclose no
-/// area and contribute nothing.
-internal fun InertiaShape.triangles(): List<Vertex> {
-    val vertices = resolvedVertices()
-    if (vertices.size < 3) return emptyList()
+    val color = shape.fill ?: shape.stroke ?: InertiaColor(0f, 0f, 0f, 0f)
+    return shape.outline().map { Vertex(it, color) }
+}
 
-    return (1 until vertices.size - 1).flatMap {
-        listOf(vertices[0], vertices[it], vertices[it + 1])
+/// A ring of corners as the triangle list the GPU draws: a fan around the first
+/// corner, so three corners are a triangle and four a quad. Fewer than three
+/// enclose no area and contribute nothing.
+///
+/// Every ring a shape resolves to is convex, so the fan covers it exactly from
+/// whichever corner it starts at.
+internal fun List<Vertex>.fan(): List<Vertex> {
+    if (size < 3) return emptyList()
+
+    return (1 until size - 1).flatMap {
+        listOf(this[0], this[it], this[it + 1])
     }
+}
+
+/// The same ring moved [distance] towards its own inside, corner by corner.
+///
+/// Each corner travels along the bisector of the two edges meeting at it, far
+/// enough that both edges end up exactly [distance] in — which is what makes the
+/// band an even thickness all the way round instead of thinning at the corners.
+/// Very sharp corners want to travel a very long way, so the distance is capped;
+/// the ring is convex and the cap only ever pulls a spike back in.
+///
+/// Which way "inside" is depends on which way the ring was wound, so that is
+/// measured rather than assumed: the sign of the area it encloses.
+private fun List<InertiaPoint>.inset(distance: Float): List<InertiaPoint> {
+    // Twice the signed area. Only the sign is read.
+    val area = indices.sumOf { index ->
+        val corner = this[index]
+        val next = this[(index + 1) % size]
+        (corner.x * next.y - next.x * corner.y).toDouble()
+    }
+    val winding = if (area < 0) -1f else 1f
+
+    fun unit(point: InertiaPoint): InertiaPoint {
+        val length = sqrt(point.x * point.x + point.y * point.y)
+        return if (length > 0f) InertiaPoint(point.x / length, point.y / length) else InertiaPoint(0f, 0f)
+    }
+
+    /// The unit normal of an edge, pointing at the ring's inside.
+    fun normal(start: InertiaPoint, end: InertiaPoint) =
+        unit(InertiaPoint(-(end.y - start.y) * winding, (end.x - start.x) * winding))
+
+    return indices.map { index ->
+        val previous = this[(index - 1 + size) % size]
+        val corner = this[index]
+        val next = this[(index + 1) % size]
+
+        val incoming = normal(previous, corner)
+        val outgoing = normal(corner, next)
+        val bisector = unit(InertiaPoint(incoming.x + outgoing.x, incoming.y + outgoing.y))
+
+        // How far along the bisector puts both edges [distance] in. Zero when
+        // the two edges double back on each other, which is a corner with no
+        // inside to move towards.
+        val projection = bisector.x * outgoing.x + bisector.y * outgoing.y
+        if (projection <= 0.1f) {
+            corner
+        } else {
+            val travel = distance / projection
+            InertiaPoint(corner.x + bisector.x * travel, corner.y + bisector.y * travel)
+        }
+    }
+}
+
+/// The outline itself, as triangles: the band between the ring and the same ring
+/// inset by [InertiaShapeProperties.strokeWidth].
+///
+/// Inset rather than centred or outset, so a stroke stays inside the box the
+/// shape was authored at. Each corner is mitred, so the band turns a corner in
+/// one piece rather than leaving the wedge that offsetting each edge on its own
+/// would.
+internal fun InertiaShapeProperties.strokeTriangles(): List<Vertex> {
+    val stroke = stroke ?: return emptyList()
+    if (strokeWidth <= 0f) return emptyList()
+
+    val outline = outline()
+    if (outline.size < 3) return emptyList()
+
+    // A stroke thicker than the shape has room for would turn the inner ring
+    // inside out. Held at the point where the ring closes on itself, which is a
+    // shape drawn solid in the stroke's colour.
+    val inner = outline.inset(minOf(strokeWidth, minOf(width, height) / 2f))
+
+    return outline.indices.flatMap { index ->
+        val next = (index + 1) % outline.size
+        listOf(
+            Vertex(outline[index], stroke), Vertex(outline[next], stroke), Vertex(inner[next], stroke),
+            Vertex(outline[index], stroke), Vertex(inner[next], stroke), Vertex(inner[index], stroke)
+        )
+    }
+}
+
+/// Everything this shape draws, as the one triangle list the GPU takes: the fill
+/// first, then the stroke over it.
+///
+/// The order is the order they are drawn in — the renderer blends source-over
+/// down the list and keeps no depth — which is what puts the outline on top of
+/// the area it encloses rather than under it. A shape authored corner by corner
+/// is all fill, since a stroke is something a *described* vector carries.
+internal fun InertiaShape.triangles(): List<Vertex> {
+    val shape = shape
+    if (vertices.isNotEmpty() || shape == null) return resolvedVertices().fan()
+
+    val fill = shape.fill
+    val filled = if (fill != null) shape.outline().map { Vertex(it, fill) }.fan() else emptyList()
+
+    return filled + shape.strokeTriangles()
 }
 
 /// The smallest box holding every corner of these shapes, in the units they are
@@ -1221,30 +1351,26 @@ internal fun List<InertiaShape>.bounds(): Rect? {
     return if (bounds.width > 0f && bounds.height > 0f) bounds else null
 }
 
-/// The same shape restated against [bounds] — the canvas's own box — so (0, 0)
-/// is the canvas's top-left corner and (1, 1) its bottom-right, which is the
-/// space the renderer draws in.
+/// Everything this shape draws, restated against [bounds] — the canvas's own
+/// box — so (0, 0) is the canvas's top-left corner and (1, 1) its bottom-right,
+/// which is the space the renderer draws in.
 ///
-/// The corners are resolved on the way through: whatever the shape was authored
-/// as, what comes out is the ring that lands in [bounds]. Its animation rides
-/// along, since normalizing is about where the shape is drawn and not about what
-/// it then does.
-internal fun InertiaShape.normalized(bounds: Rect): InertiaShape {
-    if (bounds.width <= 0f || bounds.height <= 0f) return this
+/// Triangles rather than corners, because by this point the shape *is* its
+/// drawing: the fill and the stroke have been resolved into one list, and a ring
+/// of corners could no longer say which of the two it was.
+internal fun InertiaShape.normalizedTriangles(bounds: Rect): List<Vertex> {
+    val triangles = triangles()
+    if (bounds.width <= 0f || bounds.height <= 0f) return triangles
 
-    return InertiaShape(
-        id = id,
-        vertices = resolvedVertices().map { vertex ->
-            Vertex(
-                position = InertiaPoint(
-                    x = (vertex.position.x - bounds.left) / bounds.width,
-                    y = (vertex.position.y - bounds.top) / bounds.height
-                ),
-                color = vertex.color
-            )
-        },
-        animation = animation
-    )
+    return triangles.map { vertex ->
+        Vertex(
+            position = InertiaPoint(
+                x = (vertex.position.x - bounds.left) / bounds.width,
+                y = (vertex.position.y - bounds.top) / bounds.height
+            ),
+            color = vertex.color
+        )
+    }
 }
 
 private val identityValues = InertiaAnimationValues()
