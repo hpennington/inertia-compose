@@ -124,7 +124,8 @@ enum class MessageType {
     signal,
     playbackProgress,
     tool,
-    edit
+    edit,
+    nodeMeasured
 }
 
 /// What a drag in the runtime's viewport edits.
@@ -609,6 +610,9 @@ data class MessagePlaybackProgressWrapper(val type: MessageType, val payload: Me
 @Serializable
 data class MessageSelectedNodePropertiesWrapper(val type: MessageType, val payload: MessageSelectedNodeProperties)
 
+@Serializable
+data class MessageNodeMeasuredWrapper(val type: MessageType, val payload: MessageNodeMeasured)
+
 /// Where the run currently on screen has got to, reported while it animates so
 /// the editor's playhead can follow it.
 @Serializable
@@ -760,6 +764,28 @@ data class MessageSelectedNodeProperties(
     val values: InertiaAnimationValues? = null
 )
 
+/// Runtime → editor: the box an actionable was laid out in, in this app's own
+/// pixels.
+///
+/// A shape is authored in multiples of the composable it is drawn behind — 1 is
+/// that composable's whole width — so the drawing alone never says how big it
+/// is. Only the app knows: layout is what decides it, and it decides it again at
+/// every size the app is run at. This is that measurement, sent as it is taken,
+/// so the editor can draw a shape at the size it is really drawn at without a
+/// view of the app to measure it in.
+///
+/// Carries the whole pair, not just the size: the id says which shapes it
+/// measures, and the prefix is the schema they are authored on — which is what
+/// the editor keys a shape by, since every instance of an actionable draws the
+/// same ones.
+@Serializable
+data class MessageNodeMeasured(
+    val hierarchyIdPrefix: String,
+    val hierarchyId: String,
+    val sizeX: Float,
+    val sizeY: Float
+)
+
 /// How every schema is decoded, whether it arrived over the socket or came out
 /// of the shipped animation file. Shared so the two paths cannot drift: a field
 /// the editor adds must be ignorable by both.
@@ -841,12 +867,28 @@ class WebSocketClient private constructor() : WebSocketListener() {
 
     private val scope = CoroutineScope(Dispatchers.IO)
     private var onConnected: (() -> Unit)? = null
+    /// Everything that wants to know the moment an editor attaches, rather than
+    /// only the one caller that dialled it.
+    ///
+    /// [onConnected] belongs to whoever called [connect] — the container — and
+    /// is replaced by the next caller. A node reporting its own measurement
+    /// cannot take that slot from it, and cannot wait for a layout that has
+    /// already happened, so it listens here instead.
+    private val connectedListeners = mutableSetOf<() -> Unit>()
 
     /// Asks to be connected to the editor, and to stay connected: a drop is
     /// redialed until `disconnect`. Safe to call repeatedly — a call made while a
     /// connection is up, in flight, or waiting out a backoff only re-arms
     /// `onConnect`, which every open runs so the editor is resynced after a
     /// reconnect as well as after the first dial.
+    /// Calls [listener] every time the socket comes up, and hands back the way
+    /// to stop listening — which a caller that lives and dies with a composable
+    /// has to have.
+    fun addConnectedListener(listener: () -> Unit): () -> Unit {
+        synchronized(connectionLock) { connectedListeners.add(listener) }
+        return { synchronized(connectionLock) { connectedListeners.remove(listener) } }
+    }
+
     fun connect(url: String, onConnect: () -> Unit = {}) {
         val shouldDial = synchronized(connectionLock) {
             onConnected = onConnect
@@ -958,6 +1000,19 @@ class WebSocketClient private constructor() : WebSocketListener() {
         sendPacked(MessageSelectedNodePropertiesWrapper(MessageType.selectedNodeProperties, message))
     }
 
+    /// How big a composable was laid out, which is the unit the shapes authored
+    /// against it are multiples of.
+    ///
+    /// Sent whole rather than dropped under load, unlike the two reports either
+    /// side of this: those are produced again on the next pointer event or the
+    /// next frame, while a measurement is produced only when layout changes —
+    /// and a dropped one leaves the editor unable to draw the shape at all.
+    fun sendMessageNodeMeasured(message: MessageNodeMeasured) {
+        if (!isConnected) return
+
+        sendPacked(MessageNodeMeasuredWrapper(MessageType.nodeMeasured, message))
+    }
+
     /// The playhead moves every frame, and a stall anywhere downstream would let
     /// sends pile up in the socket layer and then burst. Reports are dropped
     /// while the socket still has bytes to drain; the next frame produces
@@ -1004,16 +1059,19 @@ class WebSocketClient private constructor() : WebSocketListener() {
     }
 
     override fun onOpen(webSocket: WebSocket, response: Response) {
+        val listeners: List<() -> Unit>
         val onConnect = synchronized(connectionLock) {
             if (webSocket !== socket) return
             isConnected = true
             isDialing = false
             reconnectAttempt = 0
+            listeners = connectedListeners.toList()
             onConnected
         }
 
         InertiaLog.debug("editor connected")
         onConnect?.invoke()
+        listeners.forEach { it.invoke() }
     }
 
     override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
@@ -1055,6 +1113,7 @@ class WebSocketClient private constructor() : WebSocketListener() {
                 MessageType.translationEnded,
                 MessageType.selectedNodeProperties,
                 MessageType.playbackProgress,
+                MessageType.nodeMeasured,
                 MessageType.edit,
                 null -> Unit
             }
@@ -3013,6 +3072,38 @@ fun Inertia(
         instanceId?.let { instance ->
             isSelected = model?.actionableIds?.any { it.hierarchyId == instance } == true
         }
+    }
+
+    /// Tells the editor how big this node was laid out, so a shape authored
+    /// against it can be drawn to size in a window with no copy of this app to
+    /// measure — see [MessageNodeMeasured].
+    ///
+    /// The size rather than the position: a shape is a multiple of the box, not
+    /// of where the box sits, so a node scrolled across its container changes
+    /// nothing about the drawing.
+    val reportMeasurement = rememberUpdatedState {
+        val instance = instanceId
+        if (instance != null && layoutSize.width > 0 && layoutSize.height > 0) {
+            WebSocketClient.shared.sendMessageNodeMeasured(
+                MessageNodeMeasured(
+                    hierarchyIdPrefix = hierarchyIdPrefix,
+                    hierarchyId = instance,
+                    sizeX = layoutSize.width.toFloat(),
+                    sizeY = layoutSize.height.toFloat()
+                )
+            )
+        }
+    }
+
+    LaunchedEffect(instanceId, layoutSize) {
+        reportMeasurement.value.invoke()
+    }
+
+    /// Sent again whenever an editor attaches: layout happened long before it
+    /// was listening, and will not happen again just because it turned up.
+    DisposableEffect(Unit) {
+        val remove = WebSocketClient.shared.addConnectedListener { reportMeasurement.value.invoke() }
+        onDispose { remove() }
     }
 
     // Keyed on the model instance: the socket handlers replace it wholesale on
