@@ -284,9 +284,9 @@ data class InertiaShapeProperties(
     val stroke: InertiaColor? = null,
 
     /// How thick the outline is, in the units the shape is sized in — multiples
-    /// of the actionable's own frame, the same as [width] and [height], so a
+    /// of the actionable's shorter side, the same as [width] and [height], so a
     /// stroke keeps its weight relative to the shape at every size that frame
-    /// takes.
+    /// takes, and is the same weight across as it is down.
     ///
     /// The stroke is drawn *inside* the outline: a shape occupies exactly the
     /// box it was authored at whether or not it is stroked, so adding a stroke
@@ -297,11 +297,17 @@ data class InertiaShapeProperties(
 )
 
 /// A shape as it is authored alongside an animation: a ring of corners, each
-/// carrying its own colour, measured against the actionable it belongs to —
-/// (0, 0) that view's top-left, (1, 1) its bottom-right.
+/// carrying its own colour, measured against the actionable it belongs to — the
+/// origin its outline is drawn about, and 1 that view's shorter side.
 ///
-/// Nothing holds a shape to that box, though. Coordinates outside 0..1 reach
-/// past the actionable and go on being drawn, because the canvas they land on
+/// One side rather than each of them, so a shape is drawn in a square space and
+/// keeps the proportions it was described with: a circle of size 1 is round on a
+/// view of any shape, and only a rectangle or an oval — the two descriptions
+/// that say both of their measurements — is drawn wider than it is tall. See
+/// [InertiaShapeCanvas].
+///
+/// Nothing holds a shape to that box, though. Coordinates past that side reach
+/// beyond the actionable and go on being drawn, because the canvas they land on
 /// is the container's rather than the view's: a shape three times the size of
 /// the card it backs is authored simply by saying 3.
 ///
@@ -352,7 +358,7 @@ data class InertiaShape(
     /// was drawn.
     val transforms: InertiaAnimationValues? = null,
     /// The shapes drawn inside this one, in the units of *its* box — 1 is this
-    /// shape's whole width, the way 1 is the view's whole width one level up.
+    /// shape's shorter side, the way 1 is the view's shorter side one level up.
     ///
     /// A child is part of its parent's drawing rather than a drawing of its own:
     /// it is drawn on the parent's canvas, and every transform that moves the
@@ -825,7 +831,7 @@ data class MessageSelectedNodeProperties(
 /// pixels.
 ///
 /// A shape is authored in multiples of the composable it is drawn behind — 1 is
-/// that composable's whole width — so the drawing alone never says how big it
+/// that composable's shorter side — so the drawing alone never says how big it
 /// is. Only the app knows: layout is what decides it, and it decides it again at
 /// every size the app is run at. This is that measurement, sent as it is taken,
 /// so the editor can draw a shape at the size it is really drawn at without a
@@ -1491,18 +1497,25 @@ private fun InertiaShape.ownTriangles(): List<Vertex> {
     return filled + shape.strokeTriangles()
 }
 
-/// The box a child's coordinates are multiples of: this shape's own size, in
-/// whatever units this shape is itself measured in.
+/// The length a child's coordinates are multiples of: the shorter side of this
+/// shape's own box, in whatever units this shape is itself measured in.
 ///
 /// A described vector says its size outright. One authored corner by corner does
 /// not, so it is measured — the box its own corners occupy, which is the same
 /// thing the description would have named.
-private fun InertiaShape.childUnit(): Size {
+///
+/// One length rather than two, for the reason the actionable's own unit is one
+/// length — see [InertiaShapeCanvas]. Scaling a child by this box's width across
+/// and its height down would stretch it in whatever direction the parent happens
+/// to be longer in, so a circle nested in a wide rectangle came out an oval;
+/// measured against the shorter side it is the circle it was described as,
+/// wherever it is nested.
+private fun InertiaShape.childUnit(): Float {
     val shape = shape
-    if (shape != null && vertices.isEmpty()) return Size(shape.width, shape.height)
+    if (shape != null && vertices.isEmpty()) return minOf(shape.width, shape.height)
 
     val positions = resolvedVertices().map { it.position }
-    val first = positions.firstOrNull() ?: return Size.Zero
+    val first = positions.firstOrNull() ?: return 0f
 
     var minX = first.x
     var maxX = first.x
@@ -1516,11 +1529,11 @@ private fun InertiaShape.childUnit(): Size {
         maxY = maxOf(maxY, position.y)
     }
 
-    return Size(maxX - minX, maxY - minY)
+    return minOf(maxX - minX, maxY - minY)
 }
 
-private fun List<Vertex>.scaled(unit: Size): List<Vertex> =
-    map { Vertex(InertiaPoint(it.position.x * unit.width, it.position.y * unit.height), it.color) }
+private fun List<Vertex>.scaled(unit: Float): List<Vertex> =
+    map { Vertex(InertiaPoint(it.position.x * unit, it.position.y * unit), it.color) }
 
 /// Every corner this shape's drawing reaches, its children's included, in the
 /// units this shape is measured in.
@@ -1540,8 +1553,8 @@ internal fun InertiaShape.enclosingVertices(): List<Vertex> {
 }
 
 /// The smallest box holding every corner of these shapes, in the units they are
-/// authored in — multiples of the actionable's own frame, so `(0, 0, 1, 1)` is
-/// exactly the actionable and `(0, 0, 3, 3)` three times it.
+/// authored in — multiples of the actionable's shorter side, so a box 1 wide is
+/// as wide as that side and one 3 wide three times it.
 ///
 /// This is what the canvas is sized and placed by. Sizing it to the shapes
 /// rather than to the container is what keeps a shape whole: a canvas is a
@@ -1790,6 +1803,12 @@ class InertiaPlaybackController internal constructor() {
     /// to start.
     private var isEditorPlaying: Boolean = false
 
+    /// Whether something asked for a run the clock could not start because the
+    /// container was not holding a schema yet — the race [setSchemas] settles.
+    /// Cleared the moment a run does start, so schemas handed over again later
+    /// cannot start a second one.
+    private var isAwaitingSchemas: Boolean = false
+
     private var runStartNanos: Long? = null
     private var runOffset: Float = 0f
 
@@ -1861,6 +1880,13 @@ class InertiaPlaybackController internal constructor() {
     /// its length comes from, and [startClock] declines to start with nothing to
     /// follow. Not while the playhead is parked, where starting a run would take
     /// it away from whoever is scrubbing.
+    ///
+    /// Only the start that race is owed, which is what [isAwaitingSchemas] says.
+    /// The schemas are handed over again on every write to the data model —
+    /// selecting a node, flipping the editor's switch — and a run that has
+    /// played once and is holding its final frame has a stopped clock but a set
+    /// state, so starting on [hasTriggeredActionable] played it again from the
+    /// top every time a node was tapped.
     internal fun setSchemas(schemas: Map<String, InertiaAnimationSchema>) {
         this.schemas = schemas
 
@@ -1871,7 +1897,7 @@ class InertiaPlaybackController internal constructor() {
         // the default.
         authoredLoopDuration(schemas.values)?.let { loopDuration = it }
 
-        if (seekTime == null && hasTriggeredActionable) startClock()
+        if (seekTime == null && isAwaitingSchemas && hasTriggeredActionable) startClock()
     }
 
     /// Starts an animation the app does not have to start itself.
@@ -1993,10 +2019,15 @@ class InertiaPlaybackController internal constructor() {
         if (isTicking) return
 
         // Nothing loaded yet: there is no animation for the playhead to follow.
+        // Remembered, so the schemas' arrival can start the run this call could
+        // not — and only that run. See [setSchemas].
         if (schemas.isEmpty()) {
+            isAwaitingSchemas = true
             InertiaLog.debug("startClock: declined, no schemas held yet")
             return
         }
+
+        isAwaitingSchemas = false
 
         InertiaLog.debug("startClock: playing ${schemas.size} schema(s), duration=$playbackDuration")
 
@@ -3101,7 +3132,14 @@ fun InertiaContainer(
 
     // Only the lengths are needed here — an actionable samples its own track —
     // but the loop is as long as the longest of them, so they all have to be in.
-    LaunchedEffect(model) {
+    //
+    // Keyed on the schemas rather than on the model holding them: the model is
+    // replaced wholesale on every write, so selecting a node or flipping the
+    // editor's switch would hand the controller the same tracks again — and
+    // handing over tracks is what starts an animation. The key is compared by
+    // value, and the map is only ever written to a fresh copy, so this re-runs
+    // exactly when a track actually changed.
+    LaunchedEffect(model.inertiaSchemas) {
         playback.setSchemas(model.inertiaSchemas.toMap())
     }
 

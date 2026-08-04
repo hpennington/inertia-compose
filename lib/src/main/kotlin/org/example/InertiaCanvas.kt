@@ -323,7 +323,9 @@ internal fun List<InertiaShape>.vertexData(bounds: Rect): FloatArray {
 /// Sized to the shapes rather than to the container — see [bounds] — so a shape
 /// reaching past the actionable makes the surface bigger instead of being cut
 /// off at its edge. [actionableSize] turns those bounds from multiples of the
-/// view into pixels, which is the whole of "relative to the actionable".
+/// view into pixels, which is the whole of "relative to the actionable": its
+/// shorter side is the length they are multiples of, across and down alike, so a
+/// circle stays round on a view of any shape.
 ///
 /// Measured as zero-sized, so a surface larger than the card cannot grow the
 /// card it backs; Compose does not clip a child that overflows unless asked to,
@@ -354,12 +356,27 @@ internal fun InertiaShapeCanvas(
     // without rebuilding a vertex of it.
     val vertexData = remember(shapes, bounds) { shapes.vertexData(bounds) }
 
-    val width = (bounds.width * actionableSize.width).roundToInt()
-    val height = (bounds.height * actionableSize.height).roundToInt()
+    // The length a shape's coordinates are multiples of, across and down alike:
+    // the shorter side of the actionable's box.
+    //
+    // One length rather than two is what keeps a described vector the shape it
+    // was described as. Scaling x by the view's width and y by its height puts a
+    // shape in a square space that is then stretched to fit the view, so a
+    // circle of size 1 came out an oval on every view that was not itself
+    // square, and the taller or wider the view the further from round it got.
+    // Measured against one side, a circle is round, a square is square, and a
+    // shape keeps its proportions at every size that view takes.
+    //
+    // The shorter side rather than the longer one, so a shape authored at 1
+    // still fits inside the view it backs in both directions.
+    val unit = minOf(actionableSize.width, actionableSize.height)
+
+    val width = (bounds.width * unit).roundToInt()
+    val height = (bounds.height * unit).roundToInt()
     if (width <= 0 || height <= 0) return
 
-    val left = (bounds.left * actionableSize.width).roundToInt()
-    val top = (bounds.top * actionableSize.height).roundToInt()
+    val left = (bounds.left * unit).roundToInt()
+    val top = (bounds.top * unit).roundToInt()
 
     /// The one shape this canvas holds, when the editor has picked it. Selection
     /// is what gives a shape a canvas to itself, so there is never more than one.
