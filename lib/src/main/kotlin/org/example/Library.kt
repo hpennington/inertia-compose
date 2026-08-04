@@ -773,7 +773,7 @@ internal val inertiaMsgPack = MsgPack(MsgPackConfiguration(ignoreUnknownKeys = t
 
 /// The extension a shipped animation file carries, matching the Swift runtime's
 /// `InertiaCoding.fileExtension`.
-internal const val INERTIA_FILE_EXTENSION = "msgpack"
+internal const val INERTIA_FILE_EXTENSION = "inertia"
 
 // ========== WEBSOCKET CLIENT ==========
 
@@ -2772,7 +2772,7 @@ fun InertiaContainer(
 
     /// Outside the editor the schemas come from the shipped animation file
     /// rather than the socket, the way the SwiftUI runtime reads
-    /// `<id>.msgpack` from its bundle and the React runtime fetches it from
+    /// `<id>.inertia` from its bundle and the React runtime fetches it from
     /// `baseURL`. A missing or unreadable file leaves the actionables at their
     /// layout positions rather than bringing the app down — a broken animation
     /// is not worth a crash.
