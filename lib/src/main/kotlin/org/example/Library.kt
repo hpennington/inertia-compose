@@ -237,6 +237,27 @@ data class Vertex(val position: InertiaPoint, val color: InertiaColor)
 @Serializable
 enum class InertiaShapeType { rectangle, square, circle, oval, triangle }
 
+/// Which side of the actionable's own content a shape is drawn on.
+///
+/// A shape has always been a backdrop: drawn behind whatever the composable
+/// renders, so the label over it stays readable and the drawing stays a
+/// drawing. [top] is that same shape put in front instead — a badge, a
+/// highlight, a scribble over the view rather than under it — and it is the
+/// same canvas either way, placed after the content in the box instead of
+/// before it.
+///
+/// This sits above [InertiaShape.zIndex] rather than beside it: a z-index orders
+/// the shapes drawn on one side of the content, and nothing drawn behind a view
+/// can be lifted in front of it by counting higher.
+@Serializable
+enum class InertiaShapePosition {
+    /// Behind the actionable's content — where every shape authored before this
+    /// existed was drawn, which is why it is what an absent `position` means.
+    bottom,
+    /// Over the actionable's content.
+    top
+}
+
 /// A drawn vector as the editor records it: what it is, how big, and how it is
 /// painted — the size in the same multiples of the actionable its corners would
 /// have been measured in.
@@ -301,7 +322,15 @@ data class InertiaShape(
     val id: String,
     val vertices: List<Vertex> = emptyList(),
     val shape: InertiaShapeProperties? = null,
-    val animation: InertiaAnimationSchema? = null
+    val animation: InertiaAnimationSchema? = null,
+    /// The shapes drawn inside this one, in the units of *its* box — 1 is this
+    /// shape's whole width, the way 1 is the view's whole width one level up.
+    ///
+    /// A child is part of its parent's drawing rather than a drawing of its own:
+    /// it is drawn on the parent's canvas, and every transform that moves the
+    /// parent moves it too. Empty for a project authored before nesting, which
+    /// reads unchanged.
+    val shapes: List<InertiaShape> = emptyList()
 )
 
 @Serializable
@@ -1367,6 +1396,18 @@ internal fun InertiaShapeProperties.strokeTriangles(): List<Vertex> {
 /// the area it encloses rather than under it. A shape authored corner by corner
 /// is all fill, since a stroke is something a *described* vector carries.
 internal fun InertiaShape.triangles(): List<Vertex> {
+    val own = ownTriangles()
+    if (shapes.isEmpty()) return own
+
+    // A child is measured in this shape's box and centred where this shape is
+    // centred, so scaling by that box is the whole of the transform: the origin
+    // the two share needs no offset.
+    val unit = childUnit()
+    return own + shapes.flatMap { child -> child.triangles().scaled(unit) }
+}
+
+/// What this shape draws itself, before anything nested inside it.
+private fun InertiaShape.ownTriangles(): List<Vertex> {
     val shape = shape
     if (vertices.isNotEmpty() || shape == null) return resolvedVertices().fan()
 
@@ -1374,6 +1415,50 @@ internal fun InertiaShape.triangles(): List<Vertex> {
     val filled = if (fill != null) shape.outline().map { Vertex(it, fill) }.fan() else emptyList()
 
     return filled + shape.strokeTriangles()
+}
+
+/// The box a child's coordinates are multiples of: this shape's own size, in
+/// whatever units this shape is itself measured in.
+///
+/// A described vector says its size outright. One authored corner by corner does
+/// not, so it is measured — the box its own corners occupy, which is the same
+/// thing the description would have named.
+private fun InertiaShape.childUnit(): Size {
+    val shape = shape
+    if (shape != null && vertices.isEmpty()) return Size(shape.width, shape.height)
+
+    val positions = resolvedVertices().map { it.position }
+    val first = positions.firstOrNull() ?: return Size.Zero
+
+    var minX = first.x
+    var maxX = first.x
+    var minY = first.y
+    var maxY = first.y
+
+    positions.forEach { position ->
+        minX = minOf(minX, position.x)
+        maxX = maxOf(maxX, position.x)
+        minY = minOf(minY, position.y)
+        maxY = maxOf(maxY, position.y)
+    }
+
+    return Size(maxX - minX, maxY - minY)
+}
+
+private fun List<Vertex>.scaled(unit: Size): List<Vertex> =
+    map { Vertex(InertiaPoint(it.position.x * unit.width, it.position.y * unit.height), it.color) }
+
+/// Every corner this shape's drawing reaches, its children's included, in the
+/// units this shape is measured in.
+///
+/// What the canvas is fitted to — see [bounds]. A ring of corners alone would
+/// leave a child hanging over the edge of the canvas its parent sized, and cut
+/// it there.
+internal fun InertiaShape.enclosingVertices(): List<Vertex> {
+    if (shapes.isEmpty()) return resolvedVertices()
+
+    val unit = childUnit()
+    return resolvedVertices() + shapes.flatMap { child -> child.enclosingVertices().scaled(unit) }
 }
 
 /// The smallest box holding every corner of these shapes, in the units they are
@@ -1391,7 +1476,7 @@ internal fun InertiaShape.triangles(): List<Vertex> {
 /// Null when the shapes enclose no area, which is also when there is nothing to
 /// draw.
 internal fun List<InertiaShape>.bounds(): Rect? {
-    val positions = flatMap { shape -> shape.resolvedVertices().map { it.position } }
+    val positions = flatMap { shape -> shape.enclosingVertices().map { it.position } }
     val first = positions.firstOrNull() ?: return null
 
     var minX = first.x
