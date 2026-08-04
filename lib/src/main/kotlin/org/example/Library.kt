@@ -323,6 +323,17 @@ data class InertiaShape(
     val vertices: List<Vertex> = emptyList(),
     val shape: InertiaShapeProperties? = null,
     val animation: InertiaAnimationSchema? = null,
+    /// Whether this shape is drawn on a canvas of its own rather than sharing
+    /// one with the shapes beside it.
+    ///
+    /// A canvas is otherwise earned: a track needs one, because a shape that
+    /// moves independently cannot share a vertex buffer with shapes that do not,
+    /// and so does a selection, because the border and handles are fitted to one
+    /// shape's box. This is that decision made up front instead — what to reach
+    /// for when a track is coming later, or when a shape has to stay a layer of
+    /// its own. False is a shape that shares, which is what every shape authored
+    /// before this asked for one did.
+    val ownCanvas: Boolean = false,
     /// The shapes drawn inside this one, in the units of *its* box — 1 is this
     /// shape's whole width, the way 1 is the view's whole width one level up.
     ///
@@ -3725,7 +3736,7 @@ fun Inertia(
         // runtime makes in `isDrawnAlone`.
         if (shapes.isNotEmpty() && layoutSize != IntSize.Zero) {
             val isDrawnAlone = { shape: InertiaShape ->
-                shape.animation != null || shapeEditing?.isSelected(shape) == true
+                shape.animation != null || shape.ownCanvas || shapeEditing?.isSelected(shape) == true
             }
 
             val backdrop = shapes.filterNot(isDrawnAlone)
