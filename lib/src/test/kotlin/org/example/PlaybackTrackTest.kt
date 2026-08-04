@@ -139,6 +139,48 @@ class PlaybackTrackTest {
         assertEquals(1f, broken.sanitized().scale, 0.0001f)
     }
 
+    /// The runtime works this out for the app it is animating and a canvas view
+    /// works it out for the schemas it draws on its own. Both have to reach the
+    /// same answer, or a track padded in one is a different length from the same
+    /// track padded in the other and the two playheads drift apart over the loop.
+    @Test
+    fun `one turn of the timeline is the loop, or the longest track past it`() {
+        val short = schema(
+            keyframes = listOf(InertiaAnimationKeyframe(id = "a", values = values(1f), duration = 1f))
+        )
+        val overrunning = schema(
+            keyframes = listOf(InertiaAnimationKeyframe(id = "b", values = values(1f), duration = 4.5f))
+        )
+
+        assertEquals(3f, InertiaPlayback.duration(3f, listOf(short)), 0.0001f)
+        assertEquals(4.5f, InertiaPlayback.duration(3f, listOf(short, overrunning)), 0.0001f)
+        assertEquals(3f, InertiaPlayback.duration(3f, emptyList()), 0.0001f)
+    }
+
+    /// What a canvas view reads is what the runtime reads: one function behind
+    /// both, so a shape drawn with none of the app around it is at the frame the
+    /// app is showing.
+    @Test
+    fun `sampling at a playhead is the same read whichever asks for it`() {
+        val subject = schema(
+            keyframes = listOf(InertiaAnimationKeyframe(id = "a", values = values(1f), duration = 1f))
+        )
+
+        // Padded: past the end of its own track, held across the loop.
+        assertEquals(
+            subject.valuesAtTime(2.5f, 3f).translate[0],
+            subject.valuesAt(2.5f, filling = 3f).translate[0],
+            0.0001f
+        )
+
+        // Unpadded, which is what a run that plays once is.
+        assertEquals(
+            subject.valuesAtTime(0.5f, 3f, isRepeating = false).translate[0],
+            subject.valuesAt(0.5f, filling = null).translate[0],
+            0.0001f
+        )
+    }
+
     @Test
     fun `loop durations are clamped into range`() {
         assertEquals(0.1f, InertiaPlayback.clampLoopDuration(0.01f), 0.0001f)

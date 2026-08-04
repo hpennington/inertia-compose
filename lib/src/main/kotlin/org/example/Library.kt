@@ -1251,6 +1251,16 @@ object InertiaPlayback {
         if (!seconds.isFinite()) return defaultLoopDuration
         return seconds.coerceIn(loopDurationRange)
     }
+
+    /// One turn of the timeline for a set of schemas: the loop, or the longest
+    /// track in them where something was recorded past it.
+    ///
+    /// The runtime works this out for the app it is animating; a canvas view
+    /// works it out for the schemas it draws on its own. One answer for both, so
+    /// a track padded in here and the same track padded over there are the same
+    /// length and the two playheads mean the same thing.
+    fun duration(loop: Float, schemas: Collection<InertiaAnimationSchema>): Float =
+        maxOf(loop, schemas.maxOfOrNull { it.trackDuration() } ?: 0f)
 }
 
 /// How many corners a round vector's ring is cut into. An oval has no corners of
@@ -1566,7 +1576,7 @@ internal fun InertiaShape.enclosingVertices(): List<Vertex> {
 ///
 /// Null when the shapes enclose no area, which is also when there is nothing to
 /// draw.
-internal fun List<InertiaShape>.bounds(): Rect? {
+fun List<InertiaShape>.bounds(): Rect? {
     val positions = flatMap { shape -> shape.enclosingVertices().map { it.position } }
     val first = positions.firstOrNull() ?: return null
 
@@ -1593,7 +1603,7 @@ internal fun List<InertiaShape>.bounds(): Rect? {
 /// Triangles rather than corners, because by this point the shape *is* its
 /// drawing: the fill and the stroke have been resolved into one list, and a ring
 /// of corners could no longer say which of the two it was.
-internal fun InertiaShape.normalizedTriangles(bounds: Rect): List<Vertex> {
+fun InertiaShape.normalizedTriangles(bounds: Rect): List<Vertex> {
     val triangles = triangles()
     if (bounds.width <= 0f || bounds.height <= 0f) return triangles
 
@@ -1620,13 +1630,13 @@ private fun InertiaAnimationValues.isFinite(): Boolean =
 
 /// Falls back to the identity transform, so a NaN that slipped into a schema
 /// cannot reach the layer and blank the view out.
-internal fun InertiaAnimationValues?.sanitized(): InertiaAnimationValues =
+fun InertiaAnimationValues?.sanitized(): InertiaAnimationValues =
     if (this != null && isFinite()) this else identityValues
 
 /// The keyframes that can actually be interpolated. A zero-length keyframe —
 /// which the editor records for two keyframes captured at the same playhead
 /// position — would divide by zero when solving the segment.
-internal fun InertiaAnimationSchema.playableKeyframes(): List<InertiaAnimationKeyframe> =
+fun InertiaAnimationSchema.playableKeyframes(): List<InertiaAnimationKeyframe> =
     keyframes.mapNotNull { keyframe ->
         when {
             !keyframe.values.isFinite() -> null
@@ -1636,7 +1646,7 @@ internal fun InertiaAnimationSchema.playableKeyframes(): List<InertiaAnimationKe
     }
 
 /// How long this schema's own track runs, before any padding.
-internal fun InertiaAnimationSchema.trackDuration(): Float =
+fun InertiaAnimationSchema.trackDuration(): Float =
     playableKeyframes().fold(0f) { total, keyframe -> total + keyframe.duration }
 
 /// The playable track held at its final values until `duration` is up.
@@ -1644,7 +1654,7 @@ internal fun InertiaAnimationSchema.trackDuration(): Float =
 /// Without this a track that ends after one second would restart three times
 /// while a three-second one runs once, and the playhead — which follows the
 /// loop rather than any one actionable — would agree with neither.
-internal fun InertiaAnimationSchema.keyframesFilling(duration: Float): List<InertiaAnimationKeyframe> {
+fun InertiaAnimationSchema.keyframesFilling(duration: Float): List<InertiaAnimationKeyframe> {
     val track = playableKeyframes()
     val last = track.lastOrNull() ?: return track
 
@@ -1690,14 +1700,31 @@ private fun interpolate(
 /// Playing, pausing and scrubbing are all the same thing to a runtime that
 /// draws from the editor's clock: read the track at the playhead. It is also
 /// the only way play can pick up mid-loop.
-internal fun InertiaAnimationSchema.valuesAtTime(
+fun InertiaAnimationSchema.valuesAtTime(
     time: Float,
     loopDuration: Float,
     isRepeating: Boolean = true
-): InertiaAnimationValues {
+): InertiaAnimationValues =
     // A run that plays once is as long as its own track — padding it to the loop
     // would only hold it at the end, which is what the loop is for.
-    val track = if (isRepeating) keyframesFilling(loopDuration) else playableKeyframes()
+    valuesAt(time, filling = if (isRepeating) loopDuration else null)
+
+/// Where this animation has got to at [time], seconds into the loop.
+///
+/// The one read behind playing, pausing and scrubbing alike — and behind every
+/// place a schema is drawn: the runtime's own actionables and the shapes they
+/// carry, and a canvas view, which draws the same schemas with none of the app
+/// around them. Sampling in one place is what keeps the canvas showing the frame
+/// the app is showing.
+///
+/// [filling] is the length the track is padded out to, so actionables of
+/// different lengths come round together. Null for a run that stops when its own
+/// keyframes do, which is what a non-repeating animation is.
+///
+/// Sanitized, so a NaN out of a hand-edited file cannot reach a layer and blank
+/// the view out.
+fun InertiaAnimationSchema.valuesAt(time: Float, filling: Float?): InertiaAnimationValues {
+    val track = if (filling != null) keyframesFilling(filling) else playableKeyframes()
     var previous = initialValues.sanitized()
 
     if (track.isEmpty()) return previous
@@ -1815,8 +1842,12 @@ class InertiaPlaybackController internal constructor() {
     /// One turn of the timeline: the loop the editor drew, or the longest track,
     /// whichever is longer. Anything recorded past the end of the loop stretches
     /// it, which keeps every track the same length as every other.
+    ///
+    /// Worked out by [InertiaPlayback.duration] rather than in here, so a canvas
+    /// view drawing these schemas somewhere the app is not pads its tracks to the
+    /// same turn and the two playheads mean the same thing.
     internal val playbackDuration: Float
-        get() = maxOf(loopDuration, schemas.values.maxOfOrNull { it.trackDuration() } ?: 0f)
+        get() = InertiaPlayback.duration(loopDuration, schemas.values)
 
     // MARK: - App-facing controls
 
@@ -3084,19 +3115,36 @@ fun InertiaContainer(
             }
         }
         launch {
+            // The whole project, in place of the one this container was
+            // drawing. Replaced rather than merged in: the editor sends every
+            // animation it has on every edit, so the message says what the
+            // project *is*, not what changed in it. Merged in, an animation
+            // deleted in the editor had nothing to say — the wrapper for it
+            // simply stopped arriving — and the app under test went on playing
+            // it until it was rebuilt. Same for a shape or a keypoint dropped
+            // from one, which travel inside their schema.
+            //
+            // Only what the editor sends is ever in here to lose: the effect
+            // that reads `assets` returns early in `dev`, and a shipped build
+            // never opens this socket.
             ws.onSchema.collect { wrappers ->
                 InertiaLog.debug("schema: ${wrappers.size} wrapper(s) for container ${model.containerId}")
-                wrappers.forEach { w ->
+                val mine = wrappers.filter { w ->
                     InertiaLog.debug(
                         "schema: container=${w.container.containerId} actionableId=${w.actionableId} " +
                             "animationId=${w.animationId} invokeType=${w.schema.invokeType} " +
                             "keyframes=${w.schema.keyframes.size}"
                     )
-                    if (w.container.containerId == model.containerId) {
-                        model = model.copyMutable {
-                            inertiaSchemas[w.animationId] = w.schema
-                            actionableIdToAnimationIdMap[w.actionableId] = w.animationId
-                        }
+                    w.container.containerId == model.containerId
+                }
+
+                model = model.copyMutable {
+                    inertiaSchemas.clear()
+                    actionableIdToAnimationIdMap.clear()
+
+                    mine.forEach { w ->
+                        inertiaSchemas[w.animationId] = w.schema
+                        actionableIdToAnimationIdMap[w.actionableId] = w.animationId
                     }
                 }
             }
