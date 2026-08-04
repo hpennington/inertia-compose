@@ -334,6 +334,23 @@ data class InertiaShape(
     /// its own. False is a shape that shares, which is what every shape authored
     /// before this asked for one did.
     val ownCanvas: Boolean = false,
+    /// Where this shape sits inside whatever holds it: the actionable whose
+    /// canvas it is drawn on, or — for a nested shape — the shape it is drawn
+    /// inside of.
+    ///
+    /// A shape's corners are drawn about the origin of the box that holds it, so
+    /// every described vector was authored dead centre of its parent and there
+    /// was no way to say otherwise. This is that placement said outright, in the
+    /// same five properties a track interpolates. The translation is a fraction
+    /// of the parent's own box, the way every other measurement on a shape is.
+    ///
+    /// Placement rather than animation: it is baked into the corners the
+    /// renderer is handed — which is what lets a *nested* shape be placed at all,
+    /// since a child is drawn into its parent's vertex buffer and has no canvas
+    /// of its own to transform — and a track the shape carries plays on top of
+    /// it. Null is the identity, which is where every shape authored before this
+    /// was drawn.
+    val transforms: InertiaAnimationValues? = null,
     /// The shapes drawn inside this one, in the units of *its* box — 1 is this
     /// shape's whole width, the way 1 is the view's whole width one level up.
     ///
@@ -1406,15 +1423,61 @@ internal fun InertiaShapeProperties.strokeTriangles(): List<Vertex> {
 /// down the list and keeps no depth — which is what puts the outline on top of
 /// the area it encloses rather than under it. A shape authored corner by corner
 /// is all fill, since a stroke is something a *described* vector carries.
+///
+/// Everything here comes out placed by [InertiaShape.transforms], children
+/// included: a child is drawn into this buffer rather than onto a canvas of its
+/// own, so baking the placement into the corners is the only place a nested
+/// shape can be moved at all.
 internal fun InertiaShape.triangles(): List<Vertex> {
     val own = ownTriangles()
-    if (shapes.isEmpty()) return own
+    if (shapes.isEmpty()) return own.placed(transforms)
 
     // A child is measured in this shape's box and centred where this shape is
     // centred, so scaling by that box is the whole of the transform: the origin
-    // the two share needs no offset.
+    // the two share needs no offset. Where the child asked to sit in that box is
+    // already in the corners it hands over.
     val unit = childUnit()
-    return own + shapes.flatMap { child -> child.triangles().scaled(unit) }
+    return (own + shapes.flatMap { child -> child.triangles().scaled(unit) }).placed(transforms)
+}
+
+/// These corners moved to where [placement] puts the shape in its parent.
+///
+/// Scaled and turned about the origin of the parent's box — which is the point a
+/// described vector's outline is drawn around, so a shape left where it was
+/// authored scales and turns about its own middle — and then moved, in fractions
+/// of that same box.
+///
+/// Both rotations turn about that one point. `rotate` and `rotateCenter` differ
+/// only in the anchor a view is turned about, and a ring of corners has no view
+/// box to anchor to, so what a shape does with them is the one rotation their
+/// sum describes.
+///
+/// Opacity is carried in the corners' own alpha, since the fade has to survive
+/// being flattened into a buffer shared with shapes that are not faded.
+///
+/// Matches the Swift and WebGL runtimes corner for corner, so one placed shape
+/// is the same drawing on all three.
+private fun List<Vertex>.placed(placement: InertiaAnimationValues?): List<Vertex> {
+    if (placement == null) return this
+
+    val radians = ((placement.rotate + placement.rotateCenter) * PI / 180).toFloat()
+    val cosine = cos(radians)
+    val sine = sin(radians)
+    val translateX = placement.translate.getOrElse(0) { 0f }
+    val translateY = placement.translate.getOrElse(1) { 0f }
+
+    return map { vertex ->
+        val x = vertex.position.x * placement.scale
+        val y = vertex.position.y * placement.scale
+
+        Vertex(
+            InertiaPoint(
+                x * cosine - y * sine + translateX,
+                x * sine + y * cosine + translateY
+            ),
+            vertex.color.copy(alpha = vertex.color.alpha * placement.opacity)
+        )
+    }
 }
 
 /// What this shape draws itself, before anything nested inside it.
@@ -1465,11 +1528,15 @@ private fun List<Vertex>.scaled(unit: Size): List<Vertex> =
 /// What the canvas is fitted to — see [bounds]. A ring of corners alone would
 /// leave a child hanging over the edge of the canvas its parent sized, and cut
 /// it there.
+///
+/// Placed by [InertiaShape.transforms], the same as the triangles are: the
+/// canvas is fitted to where the drawing ends up, not to where it was drawn.
 internal fun InertiaShape.enclosingVertices(): List<Vertex> {
-    if (shapes.isEmpty()) return resolvedVertices()
+    if (shapes.isEmpty()) return resolvedVertices().placed(transforms)
 
     val unit = childUnit()
-    return resolvedVertices() + shapes.flatMap { child -> child.enclosingVertices().scaled(unit) }
+    return (resolvedVertices() + shapes.flatMap { child -> child.enclosingVertices().scaled(unit) })
+        .placed(transforms)
 }
 
 /// The smallest box holding every corner of these shapes, in the units they are
