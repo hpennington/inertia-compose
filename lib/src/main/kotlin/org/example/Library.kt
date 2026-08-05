@@ -365,6 +365,25 @@ data class InertiaShape(
     /// its own. False is a shape that shares, which is what every shape authored
     /// before this asked for one did.
     val ownCanvas: Boolean = false,
+    /// Whether this shape is drawn while the animation it belongs to is waiting
+    /// to play, or only once it is playing.
+    ///
+    /// A shape has always been backdrop: drawn from the moment the composable it
+    /// backs is on screen, whether or not anything has been triggered. That is
+    /// what a halo behind a card wants, and exactly what a shape that is *part*
+    /// of the animation — the puff a button gives off when it is pressed — does
+    /// not: it sat there in full view for however long the app waited to trigger
+    /// the track, and the only way to keep it off screen until then was to
+    /// author an opacity of zero into the first keyframe of a track of its own.
+    ///
+    /// False is that said outright: nothing is drawn until the run is on screen,
+    /// and the shape appears with it. True is the backdrop every shape authored
+    /// before this was, which is what an absent key reads as.
+    ///
+    /// Read on the shapes an actionable holds directly. A nested shape is part
+    /// of its parent's drawing — drawn into the parent's vertex buffer — so it
+    /// appears and disappears with whatever it is drawn inside of.
+    val showsBeforeAnimation: Boolean = true,
     /// Where this shape sits inside whatever holds it: the actionable whose
     /// canvas it is drawn on, or — for a nested shape — the shape it is drawn
     /// inside of.
@@ -3918,7 +3937,34 @@ fun Inertia(
             shape.animation != null || shape.ownCanvas || shapeEditing?.isSelected(shape) == true
         }
 
-        val hasCanvas = shapes.isNotEmpty() && layoutSize != IntSize.Zero
+        // Whether the run the shapes appear with is on screen yet — see
+        // [InertiaShape.showsBeforeAnimation]. The same two reads [shapeSample]
+        // makes before drawing a track, so a shape that appears with the
+        // animation appears on the frame the animation starts drawing from, and
+        // a shape carrying an `auto` track of its own appears as soon as the
+        // clock runs rather than waiting on an actionable nobody triggered.
+        //
+        // Read in composition rather than in a layer block, because this decides
+        // which canvases exist rather than what one of them is drawn at — and
+        // read only when a shape here actually asks the question, so a drawing
+        // of plain backdrops recomposes exactly as often as it did before this
+        // existed.
+        val hasTimedShapes = shapes.any { !it.showsBeforeAnimation }
+        val isTriggered = hasTimedShapes && playback.isPlaying(hierarchyIdPrefix)
+        val isPlaying = hasTimedShapes && (playback.isRunning || playback.seekTime != null)
+
+        // The shape being worked on stays drawn whatever it says: selection
+        // happens in the editor's hierarchy, but everything done to a shape
+        // after that is done to the thing on screen — dragged by its own box,
+        // sized by its handles — and one that vanished until the timeline was
+        // rolling could not be authored at all.
+        val drawnShapes = shapes.filter { shape ->
+            shape.showsBeforeAnimation
+                || shapeEditing?.isSelected(shape) == true
+                || ((isTriggered || shape.animation?.invokeType == InertiaAnimationInvokeType.auto) && isPlaying)
+        }
+
+        val hasCanvas = drawnShapes.isNotEmpty() && layoutSize != IntSize.Zero
 
         // First in the box, so they draw behind the content they back — and back
         // to front among themselves in the order they are emitted here, which is
@@ -3931,7 +3977,7 @@ fun Inertia(
         // puts a backdrop in front of the composable it backs.
         if (hasCanvas) {
             InertiaShapeLayers(
-                layers = shapes.filter { it.position == InertiaShapePosition.bottom }.layered(isDrawnAlone),
+                layers = drawnShapes.filter { it.position == InertiaShapePosition.bottom }.layered(isDrawnAlone),
                 isDrawnAlone = isDrawnAlone,
                 actionableSize = layoutSize,
                 hierarchyIdPrefix = hierarchyIdPrefix,
@@ -3952,7 +3998,7 @@ fun Inertia(
         // in nothing else.
         if (hasCanvas) {
             InertiaShapeLayers(
-                layers = shapes.filter { it.position == InertiaShapePosition.top }.layered(isDrawnAlone),
+                layers = drawnShapes.filter { it.position == InertiaShapePosition.top }.layered(isDrawnAlone),
                 isDrawnAlone = isDrawnAlone,
                 actionableSize = layoutSize,
                 hierarchyIdPrefix = hierarchyIdPrefix,
