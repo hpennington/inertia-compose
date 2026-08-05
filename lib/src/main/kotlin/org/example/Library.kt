@@ -329,6 +329,31 @@ data class InertiaShape(
     val vertices: List<Vertex> = emptyList(),
     val shape: InertiaShapeProperties? = null,
     val animation: InertiaAnimationSchema? = null,
+    /// Where this shape sits in the stack among the shapes it shares a list with
+    /// — its siblings on an actionable's canvas, or the ones drawn inside the
+    /// same parent. Higher draws in front.
+    ///
+    /// Order used to be position: shapes were drawn down the list, so moving one
+    /// in front of another meant moving it in the file, and a shape could not be
+    /// re-stacked without re-authoring the list around it. This is that ordering
+    /// said outright.
+    ///
+    /// Ties keep the order they were authored in, which is what a project
+    /// written before z-indexes existed is: every shape at 0, drawn down the
+    /// list exactly as before — see [stacked].
+    ///
+    /// It orders siblings and nothing else. A child is part of its parent's
+    /// drawing — it is drawn wherever the parent is drawn — so no z-index on it
+    /// can lift it out from behind a shape its parent sits behind.
+    val zIndex: Int = 0,
+    /// Which side of the actionable's content this shape is drawn on — see
+    /// [InertiaShapePosition]. [InertiaShapePosition.bottom] is the backdrop a
+    /// shape has always been, which is what an absent key reads as.
+    ///
+    /// Read on the shapes an actionable holds directly. A nested shape is part
+    /// of its parent's drawing and is drawn wherever the parent is, so its own
+    /// position says nothing.
+    val position: InertiaShapePosition = InertiaShapePosition.bottom,
     /// Whether this shape is drawn on a canvas of its own rather than sharing
     /// one with the shapes beside it.
     ///
@@ -1453,8 +1478,17 @@ internal fun InertiaShape.triangles(): List<Vertex> {
     // the two share needs no offset. Where the child asked to sit in that box is
     // already in the corners it hands over.
     val unit = childUnit()
-    return (own + shapes.flatMap { child -> child.triangles().scaled(unit) }).placed(transforms)
+    return (own + shapes.stacked().flatMap { child -> child.triangles().scaled(unit) }).placed(transforms)
 }
+
+/// These shapes back to front: the order they are drawn in, which is what their
+/// z-indexes say — see [InertiaShape.zIndex].
+///
+/// Ties keep the order they were authored in, which is what keeps a project with
+/// no z-indexes in it drawing exactly as it did when the list *was* the
+/// ordering. [sortedBy] is a stable sort, so the authored order is what a tie
+/// falls back to without saying so.
+fun List<InertiaShape>.stacked(): List<InertiaShape> = sortedBy { it.zIndex }
 
 /// These corners moved to where [placement] puts the shape in its parent.
 ///
@@ -3870,49 +3904,133 @@ fun Inertia(
             .then(modifierSelectedBorder(isEditable))
             .then(interactionModifier)
     ) {
-        // First in the box, so it draws behind the content it backs. Inside the
-        // animation layer and the drag offset above, so both carry the shapes
-        // along with the node rather than leaving them behind.
-        //
         // A shape with no animation of its own is backdrop: it belongs to the
         // actionable, moves only as the actionable moves, and shares one canvas
         // with every other shape like it. A shape that was given a track is a
         // drawing in its own right and gets a canvas of its own, so that track
         // can move it without disturbing the actionable or the other shapes.
-        // The drawn ones come after, in the order they were authored — shapes
-        // have no z-index of their own, and the file's order is the only
-        // ordering anyone has expressed.
         //
         // Being selected puts a shape on a canvas of its own too: the border and
         // the handles are fitted to one shape's box, and a shape sharing a
         // canvas has no box of its own to fit them to. The same split the Swift
         // runtime makes in `isDrawnAlone`.
-        if (shapes.isNotEmpty() && layoutSize != IntSize.Zero) {
-            val isDrawnAlone = { shape: InertiaShape ->
-                shape.animation != null || shape.ownCanvas || shapeEditing?.isSelected(shape) == true
-            }
+        val isDrawnAlone = { shape: InertiaShape ->
+            shape.animation != null || shape.ownCanvas || shapeEditing?.isSelected(shape) == true
+        }
 
-            val backdrop = shapes.filterNot(isDrawnAlone)
-            if (backdrop.isNotEmpty()) {
-                InertiaShapeCanvas(shapes = backdrop, actionableSize = layoutSize)
-            }
+        val hasCanvas = shapes.isNotEmpty() && layoutSize != IntSize.Zero
 
-            shapes.filter(isDrawnAlone).forEach { shape ->
-                InertiaShapeCanvas(
-                    shapes = listOf(shape),
-                    actionableSize = layoutSize,
-                    animation = shape.animation,
-                    hierarchyIdPrefix = hierarchyIdPrefix,
-                    containerSize = canvasSize,
-                    editing = shapeEditing
-                )
-            }
+        // First in the box, so they draw behind the content they back — and back
+        // to front among themselves in the order they are emitted here, which is
+        // the order their z-indexes put them in. Inside the animation layer and
+        // the drag offset above, so both carry the shapes along with the node
+        // rather than leaving them behind.
+        //
+        // The two sides are separate stacks, split before either is layered: a
+        // z-index orders the shapes on one side of the content, and no number
+        // puts a backdrop in front of the composable it backs.
+        if (hasCanvas) {
+            InertiaShapeLayers(
+                layers = shapes.filter { it.position == InertiaShapePosition.bottom }.layered(isDrawnAlone),
+                isDrawnAlone = isDrawnAlone,
+                actionableSize = layoutSize,
+                hierarchyIdPrefix = hierarchyIdPrefix,
+                containerSize = canvasSize,
+                editing = shapeEditing
+            )
         }
 
         CompositionLocalProvider(
             LocalInertiaParentId provides instanceId
         ) {
             content()
+        }
+
+        // The same canvases on the other side of the content, for the shapes
+        // authored to sit over the composable rather than behind it. After the
+        // content in the box, which is what draws them over it — the two differ
+        // in nothing else.
+        if (hasCanvas) {
+            InertiaShapeLayers(
+                layers = shapes.filter { it.position == InertiaShapePosition.top }.layered(isDrawnAlone),
+                isDrawnAlone = isDrawnAlone,
+                actionableSize = layoutSize,
+                hierarchyIdPrefix = hierarchyIdPrefix,
+                containerSize = canvasSize,
+                editing = shapeEditing
+            )
+        }
+    }
+}
+
+/// These shapes as the canvases they are drawn on, back to front: the order
+/// their z-indexes put them in, cut into runs wherever one of them has to be
+/// drawn on a canvas of its own.
+///
+/// A shape drawn alone is a layer by itself; the shapes between two of those
+/// share one canvas, the way every backdrop shape here used to. Cutting the run
+/// at those points is what makes a z-index mean the same thing for a moving
+/// shape as for a still one: canvases are children of one box, children draw in
+/// the order they are emitted, so an animated shape can sit *behind* a plain one
+/// rather than always floating over the whole backdrop.
+///
+/// The same layering the Swift runtime builds in `InertiaShapesView.layers`.
+internal fun List<InertiaShape>.layered(
+    isDrawnAlone: (InertiaShape) -> Boolean
+): List<List<InertiaShape>> {
+    val layers = mutableListOf<MutableList<InertiaShape>>()
+    var isSharedRunOpen = false
+
+    stacked().forEach { shape ->
+        when {
+            isDrawnAlone(shape) -> {
+                layers.add(mutableListOf(shape))
+                isSharedRunOpen = false
+            }
+            isSharedRunOpen -> layers.last().add(shape)
+            else -> {
+                layers.add(mutableListOf(shape))
+                isSharedRunOpen = true
+            }
+        }
+    }
+
+    return layers
+}
+
+/// One side of an actionable's drawing: a canvas per layer, emitted back to
+/// front — see [layered].
+///
+/// A layer holding one shape drawn alone is that shape's own drawing, and is
+/// handed what moves it: its track, the actionable it belongs to, and the
+/// editor's selection. A shared run is backdrop and needs none of that; it moves
+/// only as the actionable moves.
+///
+/// Keyed by the first shape in the layer, which is a name no other layer can
+/// take — a shape belongs to exactly one — so a canvas keeps its state when the
+/// layer above it is re-stacked or deleted rather than being handed its
+/// neighbour's.
+@Composable
+private fun InertiaShapeLayers(
+    layers: List<List<InertiaShape>>,
+    isDrawnAlone: (InertiaShape) -> Boolean,
+    actionableSize: IntSize,
+    hierarchyIdPrefix: String,
+    containerSize: IntSize,
+    editing: InertiaShapeEditing?
+) {
+    layers.forEach { layer ->
+        val alone = layer.singleOrNull()?.takeIf(isDrawnAlone)
+
+        key(layer.first().id) {
+            InertiaShapeCanvas(
+                shapes = layer,
+                actionableSize = actionableSize,
+                animation = alone?.animation,
+                hierarchyIdPrefix = if (alone != null) hierarchyIdPrefix else null,
+                containerSize = if (alone != null) containerSize else IntSize.Zero,
+                editing = if (alone != null) editing else null
+            )
         }
     }
 }
