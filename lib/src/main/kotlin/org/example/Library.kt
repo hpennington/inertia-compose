@@ -3721,16 +3721,29 @@ fun Inertia(
     }
 
     /// Ends a gesture and hands the result to the editor to be written into the
-    /// schema. One message whatever the tool, carrying the whole transform: a
-    /// keyframe holds all five values, so the four this gesture did not touch
-    /// have to travel with the one it did.
+    /// schema, dropping the edit now that the schema is the one carrying it.
+    ///
+    /// One message whatever the tool, carrying the whole transform: a keyframe
+    /// holds all five values, so the four this gesture did not touch have to
+    /// travel with the one it did.
     val commitEdit = {
         val m = currentModel
         if (m != null && currentCanvasSize != IntSize.Zero) {
+            // Measured before the edit is dropped: what goes on the wire is the
+            // gesture folded into the node's starting values, not the values on
+            // their own.
+            val authored = currentInitialValues.applying(edit, currentCanvasSize)
+
+            // The gesture has been handed over, so it stops being this node's to
+            // show: from here the schema coming back is what puts the node where
+            // the gesture left it. Held on to, it would be counted a second time
+            // on top of the values it authored.
+            edit = InertiaToolEdit()
+
             WebSocketClient.shared.sendMessageEdit(
                 MessageEdit(
                     tool = currentTool,
-                    values = currentInitialValues.applying(edit, currentCanvasSize),
+                    values = authored,
                     // The whole selection as it stands now, not as it stood when
                     // this gesture's handles were published: an edit is authored
                     // against every node the editor has picked.
