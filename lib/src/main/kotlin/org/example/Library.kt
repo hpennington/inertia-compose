@@ -1671,6 +1671,117 @@ fun InertiaShape.normalizedTriangles(bounds: Rect): List<Vertex> {
     }
 }
 
+/// The shape a press at [point] lands on, wherever it is nested, or null for a
+/// press that misses every one of them.
+///
+/// [point] is in the units these shapes are authored in — multiples of the
+/// actionable's shorter side, measured from its middle, which is the same space
+/// [bounds] answers in.
+///
+/// Front to back, so a press on two overlapping shapes picks the one drawn on
+/// top: the list is stacked and then read backwards, which is the drawing order
+/// reversed. What each shape is tested against is its drawing rather than its
+/// box — see [InertiaShape.hitTest].
+fun List<InertiaShape>.hitTest(point: InertiaPoint): InertiaShape? {
+    stacked().asReversed().forEach { shape ->
+        shape.hitTest(point)?.let { return it }
+    }
+
+    return null
+}
+
+/// The shape a press at [point] lands on — this one, or the innermost shape
+/// nested inside it — or null for a press that misses everything here.
+///
+/// [point] is in the units this shape is measured in, which is the space its own
+/// [triangles] answer in: the parent's box, before this shape's placement has
+/// moved anything.
+///
+/// What is tested is the drawing rather than the box around it. A press in the
+/// corner of a circle's bounding box, or in the margin beside a triangle's
+/// slope, misses — so it falls through to whatever is behind instead of being
+/// swallowed by a backdrop the user cannot see there. An unfilled shape is its
+/// outline and nothing more, so a press through the middle of a ring misses it
+/// too.
+///
+/// Children first and back to front reversed, because that is the order they are
+/// drawn in and a press belongs to whatever is on top of the stack at that point
+/// — the same reading [triangles] lays down and this one inverts.
+internal fun InertiaShape.hitTest(point: InertiaPoint): InertiaShape? {
+    val local = point.unplaced(transforms) ?: return null
+
+    val unit = childUnit()
+    if (unit > 0f) {
+        shapes.stacked().asReversed().forEach { child ->
+            child.hitTest(InertiaPoint(local.x / unit, local.y / unit))?.let { return it }
+        }
+    }
+
+    return if (ownTriangles().hits(local)) this else null
+}
+
+/// This point carried back out of [placement] — the inverse of the trip
+/// [placed] takes a corner on, so a press given in the parent's box lands in the
+/// space the shape's own corners were authored in.
+///
+/// Null for a shape scaled to nothing: it draws no area at all, so there is
+/// nothing for a press to land on and no scale to divide back out.
+private fun InertiaPoint.unplaced(placement: InertiaAnimationValues?): InertiaPoint? {
+    if (placement == null) return this
+    if (placement.scale == 0f) return null
+
+    // Turned back rather than forward, and the move undone before the turn,
+    // because `placed` moves last.
+    val radians = (-(placement.rotate + placement.rotateCenter) * PI / 180).toFloat()
+    val cosine = cos(radians)
+    val sine = sin(radians)
+
+    val x = this.x - placement.translate.getOrElse(0) { 0f }
+    val y = this.y - placement.translate.getOrElse(1) { 0f }
+
+    return InertiaPoint(
+        (x * cosine - y * sine) / placement.scale,
+        (x * sine + y * cosine) / placement.scale
+    )
+}
+
+/// Whether [point] falls on any of these triangles, the list read three corners
+/// at a time — the way the renderer draws it, so what answers yes is exactly
+/// what was painted.
+///
+/// A trailing corner or two, which the renderer would not draw either, is left
+/// out rather than treated as a triangle of its own.
+private fun List<Vertex>.hits(point: InertiaPoint): Boolean {
+    for (index in 0 until (size - size % 3) step 3) {
+        if (contains(point, this[index].position, this[index + 1].position, this[index + 2].position)) {
+            return true
+        }
+    }
+
+    return false
+}
+
+/// Whether [point] is inside the triangle [a], [b], [c].
+///
+/// Which side of each edge the point falls on, by the sign of the cross product
+/// with that edge. Inside is the same side of all three; a zero is the point
+/// sitting on an edge, which counts as inside, so two triangles sharing an edge
+/// leave no seam for a press to fall through.
+///
+/// Winding is not assumed: the rings a shape resolves to are wound whichever way
+/// they were authored, and a fan of a clockwise ring is every bit as much a
+/// triangle as a fan of a counter-clockwise one.
+private fun contains(point: InertiaPoint, a: InertiaPoint, b: InertiaPoint, c: InertiaPoint): Boolean {
+    fun side(point: InertiaPoint, start: InertiaPoint, end: InertiaPoint): Float =
+        (point.x - end.x) * (start.y - end.y) - (start.x - end.x) * (point.y - end.y)
+
+    val ab = side(point, a, b)
+    val bc = side(point, b, c)
+    val ca = side(point, c, a)
+
+    return !((ab < 0f || bc < 0f || ca < 0f) && (ab > 0f || bc > 0f || ca > 0f))
+}
+
 private val identityValues = InertiaAnimationValues()
 
 private fun InertiaAnimationValues.isFinite(): Boolean =
@@ -2549,7 +2660,10 @@ internal class InertiaShapeEditing(
     /// so it survives the canvas being rebuilt mid-drag.
     val edit: (InertiaShape) -> InertiaToolEdit,
     val onChange: (InertiaShape, InertiaToolEdit) -> Unit,
-    val onEnded: (InertiaShape) -> Unit
+    val onEnded: (InertiaShape) -> Unit,
+    /// Picks the shape a press landed on up, or puts it down again — the same
+    /// toggle a tap on an actionable runs, on the same selection.
+    val onTap: (InertiaShape) -> Unit
 )
 
 /// The handle overlay's state, held per [InertiaContainer] and written by the
@@ -3882,12 +3996,42 @@ fun Inertia(
         Modifier
     }
 
+    /// Picks a shape up, or puts it down again: the toggle a press on the
+    /// artwork runs, which is the same one a tap on this node's own body runs
+    /// and writes to the same selection.
+    ///
+    /// A shape travels as an [ActionableIdPair] like anything else — its own id
+    /// under the schema that carries it, which is how the editor's hierarchy
+    /// names it too, so picking a shape out here lights up the same row.
+    ///
+    /// The whole selection goes back on the wire rather than the one shape that
+    /// changed, because that is what a [MessageActionables] says: not what was
+    /// picked, but what *is* picked.
+    val toggleShapeSelection = { shape: InertiaShape ->
+        val m = currentModel
+        if (m != null) {
+            val next = m.actionableIds.toMutableSet()
+            val pair = ActionableIdPair(
+                hierarchyIdPrefix = hierarchyIdPrefix,
+                hierarchyId = shape.id
+            )
+            if (!next.remove(pair)) next.add(pair)
+
+            currentUpdateModel { prev -> prev.copyMutable { actionableIds = next } }
+
+            WebSocketClient.shared.sendMessageActionables(
+                MessageType.actionables,
+                MessageActionables(tree = m.tree.toDTO(), actionableIds = next.toSet())
+            )
+        }
+    }
+
     /// Everything a shape drawn behind this node needs in order to be picked and
     /// dragged, or null when nothing here is selectable.
     ///
-    /// Not gated on this node's own selection: a shape is picked in the editor's
-    /// hierarchy panel, and picking one does not pick the view it was authored
-    /// behind.
+    /// Not gated on this node's own selection: picking a shape does not pick the
+    /// view it was authored behind — see [InertiaShapeEditing.onTap], which is
+    /// what makes touching a vector select the vector rather than this node.
     val shapeEditing = if (model?.isActionable == true && instanceId != null) {
         InertiaShapeEditing(
             isSelected = { shape ->
@@ -3900,7 +4044,8 @@ fun Inertia(
             owner = { shape -> "$instanceId--${shape.id}" },
             edit = { shape -> shapeEdits[shape.id] ?: InertiaToolEdit() },
             onChange = { shape, next -> shapeEdits[shape.id] = next },
-            onEnded = commitShapeEdit
+            onEnded = commitShapeEdit,
+            onTap = { shape -> toggleShapeSelection(shape) }
         )
     } else {
         null

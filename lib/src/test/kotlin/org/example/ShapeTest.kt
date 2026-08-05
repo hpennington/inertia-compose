@@ -1,6 +1,7 @@
 package org.inertiagraphics.inertia
 
 import androidx.compose.ui.geometry.Rect
+import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.pow
 import kotlin.math.sqrt
@@ -496,5 +497,141 @@ class ShapeTest {
         assertEquals(InertiaPoint(-1f, -1f), triangles[0].position)
         assertEquals(InertiaPoint(1f, -1f), triangles[1].position)
         assertEquals(InertiaPoint(0.75f, -0.75f), triangles[2].position)
+    }
+
+    // MARK: - The shape a press lands on
+
+    /// A described vector under a name of its own, filled unless it was asked
+    /// for as an outline.
+    private fun drawn(
+        id: String,
+        type: InertiaShapeType,
+        size: Float,
+        stroke: Float = 0f,
+        transforms: InertiaAnimationValues? = null,
+        zIndex: Int = 0,
+        shapes: List<InertiaShape> = emptyList()
+    ) = InertiaShape(
+        id = id,
+        shape = InertiaShapeProperties(
+            id = "$id-properties",
+            type = type,
+            width = size,
+            height = size,
+            fill = if (stroke > 0f) null else red,
+            stroke = if (stroke > 0f) red else null,
+            strokeWidth = stroke
+        ),
+        shapes = shapes,
+        zIndex = zIndex,
+        transforms = transforms
+    )
+
+    /// The middle of a shape is the shape. The whole of picking one by touching
+    /// it rests on this.
+    @Test
+    fun `press on a shape finds it`() {
+        assertEquals("square", listOf(drawn("square", InertiaShapeType.square, 1f)).hitTest(InertiaPoint(0f, 0f))?.id)
+    }
+
+    /// What a bounding box would have got wrong, and the reason the artwork is
+    /// tested rather than the box around it: the corner of a circle's box is not
+    /// the circle, so a press there has to go on through to whatever is behind.
+    @Test
+    fun `press in the corner of a round shapes box misses it`() {
+        val circle = listOf(drawn("circle", InertiaShapeType.circle, 1f))
+
+        // Just inside the box, which spans +/-0.5 in both directions, and well
+        // outside the radius of 0.5 that the circle actually fills.
+        assertNull(circle.hitTest(InertiaPoint(0.49f, 0.49f)))
+        assertEquals("circle", circle.hitTest(InertiaPoint(0.4f, 0f))?.id)
+    }
+
+    /// A shape drawn as its outline alone encloses nothing in the middle, so a
+    /// press through the hole falls to what is behind it rather than sticking to
+    /// the ring around it.
+    @Test
+    fun `press through an unfilled shape misses it`() {
+        val ring = listOf(drawn("ring", InertiaShapeType.square, 1f, stroke = 0.1f))
+
+        assertNull(ring.hitTest(InertiaPoint(0f, 0f)))
+        // On the band itself, which runs the 0.1 inside the edge at 0.5.
+        assertEquals("ring", ring.hitTest(InertiaPoint(0.45f, 0f))?.id)
+    }
+
+    /// Nothing under the finger at all.
+    @Test
+    fun `press outside every shape finds nothing`() {
+        assertNull(listOf(drawn("square", InertiaShapeType.square, 1f)).hitTest(InertiaPoint(4f, 4f)))
+        assertNull(emptyList<InertiaShape>().hitTest(InertiaPoint(0f, 0f)))
+    }
+
+    /// Two shapes over one another hand the press to the one on top, which is
+    /// the one the z-indexes draw last — not the one written first.
+    @Test
+    fun `press on overlapping shapes picks the one drawn on top`() {
+        val drawing = listOf(
+            drawn("under", InertiaShapeType.square, 1f, zIndex = 5),
+            drawn("over", InertiaShapeType.square, 1f, zIndex = 9)
+        )
+
+        assertEquals("over", drawing.hitTest(InertiaPoint(0f, 0f))?.id)
+        assertEquals("over", drawing.asReversed().hitTest(InertiaPoint(0f, 0f))?.id)
+    }
+
+    /// A press is tested against where a shape is *drawn*, not where its corners
+    /// were authored: a placement moves the shape, and it has to move what
+    /// answers for it.
+    @Test
+    fun `press follows a placed shape`() {
+        val shifted = listOf(
+            drawn("square", InertiaShapeType.square, 1f, transforms = InertiaAnimationValues(translate = listOf(2f, 0f)))
+        )
+
+        assertNull(shifted.hitTest(InertiaPoint(0f, 0f)))
+        assertEquals("square", shifted.hitTest(InertiaPoint(2f, 0f))?.id)
+    }
+
+    /// Turning is undone as well as moving, and in the right order — the shape
+    /// is turned where it was drawn and only then moved there, so unwinding the
+    /// move first is what puts the press back on the artwork.
+    @Test
+    fun `press follows a turned and moved shape`() {
+        val bar = InertiaShape(
+            id = "bar",
+            shape = InertiaShapeProperties(id = "bar-properties", type = InertiaShapeType.rectangle, width = 4f, height = 0.5f, fill = red),
+            transforms = InertiaAnimationValues(translate = listOf(2f, 0f), rotate = 45f)
+        )
+
+        val corner = 2f * kotlin.math.cos(PI.toFloat() / 4f)
+
+        assertEquals("bar", listOf(bar).hitTest(InertiaPoint(2f + corner * 0.9f, corner * 0.9f))?.id)
+        // The same distance out along the axis the bar is no longer on.
+        assertNull(listOf(bar).hitTest(InertiaPoint(2f + corner * 0.9f, -corner * 0.9f)))
+    }
+
+    /// A nested shape is drawn into its parent's vertex buffer and has no canvas
+    /// of its own, but it is a row of its own in the editor's hierarchy — so a
+    /// press on it has to name the child rather than the parent it was drawn
+    /// inside of.
+    @Test
+    fun `press on a nested shape finds the child`() {
+        val child = drawn("child", InertiaShapeType.square, 0.25f, transforms = InertiaAnimationValues(translate = listOf(0.3f, 0f)))
+        val parent = listOf(drawn("parent", InertiaShapeType.square, 2f, shapes = listOf(child)))
+
+        // The child is a quarter of the parent's box wide — 0.5 across — and
+        // sits 0.6 out from the middle of a parent two wide.
+        assertEquals("child", parent.hitTest(InertiaPoint(0.6f, 0f))?.id)
+        // Parent where the child is not.
+        assertEquals("parent", parent.hitTest(InertiaPoint(-0.6f, 0f))?.id)
+    }
+
+    /// A press misses a shape scaled away to nothing, which is also a shape with
+    /// no area left to draw.
+    @Test
+    fun `press misses a shape scaled to nothing`() {
+        val gone = InertiaAnimationValues(scale = 0f)
+
+        assertNull(listOf(drawn("square", InertiaShapeType.square, 1f, transforms = gone)).hitTest(InertiaPoint(0f, 0f)))
     }
 }

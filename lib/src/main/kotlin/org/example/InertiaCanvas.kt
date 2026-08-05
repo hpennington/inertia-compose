@@ -10,6 +10,9 @@ import android.opengl.EGLSurface
 import android.opengl.GLES20
 import android.view.TextureView
 import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -24,6 +27,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.IntSize
@@ -415,6 +419,11 @@ internal fun InertiaShapeCanvas(
                     containerSize = containerSize,
                     sample = sample
                 )
+                    // Inside every layer above, so a press is carried back out
+                    // through them before it is tested: Compose hit-tests
+                    // through a `graphicsLayer`, so what arrives here is already
+                    // in the space the artwork was drawn in.
+                    .then(pickModifier(shapes, bounds, unit, editing))
                     // Inside every layer above, so the border stays glued to the
                     // shape as it turns and scales — exactly where an
                     // actionable's own sits relative to it.
@@ -427,6 +436,66 @@ internal fun InertiaShapeCanvas(
 
         layout(0, 0) {
             placeables.forEach { it.place(left, top) }
+        }
+    }
+}
+
+/// What listens for a press on one canvas, so a shape can be picked by touching
+/// it rather than only by finding its row in the editor's hierarchy.
+///
+/// [Modifier] and nothing else outside the editor: a shape is backdrop in a
+/// shipped build, and a backdrop that took touches would swallow the taps meant
+/// for the composables it sits behind.
+///
+/// A press that lands on the artwork belongs to the shape, and is consumed so
+/// that it does. The actionable this canvas is drawn inside of runs its own
+/// gesture on the box around it — [awaitFirstDown] there wants an unconsumed
+/// press — so without taking the press here, touching a vector would pick the
+/// vector *and* toggle the view it was authored behind.
+///
+/// A press that misses is left alone rather than consumed, which is what lets it
+/// go on through: a canvas is fitted to the box its shapes occupy together, and
+/// that box is mostly not shape. The corner beside a circle, the margin beside a
+/// triangle's slope, the hole through an unfilled ring — all of it reaches the
+/// actionable underneath exactly as it did before any of this existed. See
+/// [InertiaShape.hitTest].
+///
+/// One handler for the whole canvas rather than one per shape, because the
+/// shapes sharing it share a vertex buffer and have no boxes of their own to
+/// hang a gesture off. Which of them was pressed is answered by testing the
+/// point, which is also the only way to answer it for a *nested* shape — drawn
+/// into its parent's buffer, and a row of its own in the hierarchy all the same.
+private fun pickModifier(
+    shapes: List<InertiaShape>,
+    /// The box these shapes occupy together, which is what the canvas was sized
+    /// and placed by — so it is also what turns a press on the canvas back into
+    /// a point in the units the shapes are authored in.
+    bounds: Rect,
+    /// The length a shape's coordinate of 1 is drawn at, in pixels.
+    unit: Int,
+    editing: InertiaShapeEditing?
+): Modifier {
+    if (editing == null || unit <= 0) return Modifier
+
+    return Modifier.pointerInput(shapes, bounds, unit, editing.onTap) {
+        awaitEachGesture {
+            val down = awaitFirstDown()
+
+            val shape = shapes.hitTest(
+                InertiaPoint(
+                    bounds.left + down.position.x / unit,
+                    bounds.top + down.position.y / unit
+                )
+            ) ?: return@awaitEachGesture
+
+            down.consume()
+
+            // A press that wanders off the shape and lifts elsewhere is not a
+            // tap, and picks nothing — the same reading every tap detector makes.
+            waitForUpOrCancellation()?.let { up ->
+                up.consume()
+                editing.onTap(shape)
+            }
         }
     }
 }
