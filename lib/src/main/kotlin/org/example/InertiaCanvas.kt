@@ -375,8 +375,14 @@ internal fun InertiaShapeCanvas(
     val height = (bounds.height * unit).roundToInt()
     if (width <= 0 || height <= 0) return
 
-    val left = (bounds.left * unit).roundToInt()
-    val top = (bounds.top * unit).roundToInt()
+    // Where the box sits inside the actionable, measured from the *middle* of it
+    // rather than its top-left corner: the origin a shape's coordinates are drawn
+    // about is the centre of the view it backs, so a shape half the size of its
+    // actionable sits in the middle of it rather than hanging off a corner. This
+    // Layout places into a Box that aligns top-start, so that half-view step is
+    // taken here — the same one the Swift runtime gets from centring its ZStack.
+    val left = (actionableSize.width / 2f + bounds.left * unit).roundToInt()
+    val top = (actionableSize.height / 2f + bounds.top * unit).roundToInt()
 
     /// The one shape this canvas holds, when the editor has picked it. Selection
     /// is what gives a shape a canvas to itself, so there is never more than one.
