@@ -426,9 +426,46 @@ data class InertiaAnimationState(
 
 class InertiaDataModel(
     val containerId: String,
-    var tree: Tree,
-    var actionableIds: MutableSet<ActionableIdPair>
+    /// One hierarchy per container instance, keyed by the container's
+    /// `hierarchyId` — which is also the id of the tree filed under it.
+    ///
+    /// Keyed rather than held singly because a container's `hierarchyId` is what
+    /// tells its instances apart, and one app can have several composed or swap
+    /// between them: a container per tab draws a different set of nodes each. A
+    /// [Tree] has one [Tree.rootNode], so a shared one could only ever describe
+    /// whichever container registered last — every message the runtime sent
+    /// afterwards carried that container's hierarchy no matter which one the
+    /// user was acting in, and the editor merged the selection into the wrong
+    /// panel.
+    val trees: MutableMap<String, Tree> = mutableMapOf(),
+    /// What is picked in each container, keyed the same way as [trees].
+    ///
+    /// Split for the reason the trees are: a [MessageActionables] is a tree and
+    /// the selection made *in* it, so sending one container's tree with every
+    /// container's selection tells the editor that nodes it cannot see in that
+    /// hierarchy are picked in it.
+    val actionableIdsByContainer: MutableMap<String, MutableSet<ActionableIdPair>> = mutableMapOf()
 ) {
+    /// The hierarchy a container is building, made the first time it is asked
+    /// for. The tree is named after the container instance, so the editor —
+    /// which files what it is told by `tree.id` — keeps one panel per container
+    /// rather than one per app.
+    fun treeFor(containerId: String): Tree = trees.getOrPut(containerId) { Tree(containerId) }
+
+    /// The container's hierarchy if it has started one, without making it.
+    fun treeOrNull(containerId: String?): Tree? = containerId?.let { trees[it] }
+
+    /// What is picked in one container.
+    fun actionableIds(containerId: String?): Set<ActionableIdPair> =
+        containerId?.let { actionableIdsByContainer[it] } ?: emptySet()
+
+    /// Replaces what is picked in one container — what the editor saying so
+    /// amounts to. Left alone are the other containers, which the editor was not
+    /// talking about.
+    fun setActionableIds(containerId: String, ids: Set<ActionableIdPair>) {
+        actionableIdsByContainer[containerId] = ids.toMutableSet()
+    }
+
     /// The animation schemas the editor has sent, keyed by `animationId`. An
     /// actionable finds its own through [actionableIdToAnimationIdMap], which is
     /// the indirection that lets two instances of the same card share a track.
@@ -653,6 +690,15 @@ class Tree(val id: String) {
     var rootNode: Node? = null
     val nodeMap: MutableMap<String, Node> = mutableMapOf()
 
+    /// Files a node under its parent, and is safe to call again for a node this
+    /// tree already holds.
+    ///
+    /// Idempotent because a view registers itself whenever its hierarchy id
+    /// lands, and a view that leaves the composition and comes back — a tab
+    /// switch is one — lands the same id a second time. Appending blindly gave
+    /// the parent two children with one id, so the hierarchy the editor drew
+    /// listed the node twice while only one of the rows answered to the
+    /// selection.
     fun addRelationship(id: String, parentId: String?, parentIsContainer: Boolean = false) {
         val current = nodeMap.getOrPut(id) {
             Node(id, parentId).also { it.tree = this }
@@ -661,7 +707,9 @@ class Tree(val id: String) {
             val parent = nodeMap.getOrPut(parentId) {
                 Node(parentId).also { it.tree = this }
             }
-            parent.addChild(current)
+            if (parent.children.none { it.id == id }) {
+                parent.addChild(current)
+            }
             if (parentIsContainer || (rootNode == null && parent.parent == null)) {
                 rootNode = parent
             }
@@ -955,7 +1003,12 @@ class WebSocketClient private constructor() : WebSocketListener() {
     var isConnected: Boolean = false
         private set
 
-    private val _onSelectedIds = MutableSharedFlow<Set<ActionableIdPair>>(replay = 0)
+    /// The editor's selection, with the id of the hierarchy it was made in.
+    ///
+    /// The tree id travels with it because a runtime can be drawing more than
+    /// one — a container per tab, say — and a selection only means anything
+    /// against the one it was picked in.
+    private val _onSelectedIds = MutableSharedFlow<Pair<String, Set<ActionableIdPair>>>(replay = 0)
     val onSelectedIds = _onSelectedIds.asSharedFlow()
 
     private val _onSchema = MutableSharedFlow<List<InertiaSchemaWrapper>>(replay = 0)
@@ -1197,7 +1250,7 @@ class WebSocketClient private constructor() : WebSocketListener() {
                 }
                 MessageType.actionables -> {
                     val decoded = msgPack.decodeFromByteArray<MessageActionables>(wrapper.payload)
-                    scope.launch { _onSelectedIds.emit(decoded.actionableIds) }
+                    scope.launch { _onSelectedIds.emit(decoded.tree.id to decoded.actionableIds) }
                 }
                 MessageType.schema -> {
                     val decoded = msgPack.decodeFromByteArray<MessageSchema>(wrapper.payload)
@@ -3175,6 +3228,24 @@ object SharedIndexManager {
     val indexMap: MutableMap<String, Int> = mutableMapOf()
     val objectIndexMap: MutableMap<String, Int> = mutableMapOf()
     val objectIdSet: MutableSet<String> = mutableSetOf()
+
+    /// Names the next instance of [prefix] in this container, and moves the
+    /// counter along.
+    ///
+    /// Counted per container rather than per prefix alone: the index is what
+    /// tells two instances of the same authored view apart, and two containers
+    /// each holding one instance are not two instances. Sharing one counter had
+    /// the second container's node come up as `card0--1` with no `card0--0`
+    /// beside it, so a selection authored against the first container named
+    /// nothing the second one drew.
+    fun claimId(containerId: String?, prefix: String): String {
+        // Separated, or container `ab` with prefix `c` and container `a` with
+        // prefix `bc` would share a counter.
+        val key = "${containerId.orEmpty()}$prefix"
+        val index = indexMap[key] ?: 0
+        indexMap[key] = index + 1
+        return "$prefix--$index"
+    }
 }
 
 // ========== COMPOSABLES ==========
@@ -3198,11 +3269,7 @@ fun InertiaContainer(
 ) {
     var model by remember {
         mutableStateOf(
-            InertiaDataModel(
-                containerId = id,
-                tree = Tree(id),
-                actionableIds = mutableSetOf()
-            )
+            InertiaDataModel(containerId = id)
         )
     }
 
@@ -3253,7 +3320,7 @@ fun InertiaContainer(
         }
     }
 
-    LaunchedEffect(dev, model.tree, baseURL) {
+    LaunchedEffect(dev, hierarchyId, baseURL) {
         // Nothing but the editor is on the other end of this socket, so a
         // shipped build does not open one. The SwiftUI runtime gates its
         // channel on `dev` and the React runtime returns before connecting.
@@ -3269,16 +3336,24 @@ fun InertiaContainer(
         InertiaLog.debug("connecting to $baseURL")
 
         ws.connect(url = baseURL) {
+            // This container's own tree and its own selection, never the app's:
+            // the two halves of a `MessageActionables` are read together, and
+            // the editor files what it is told under the tree that came with it.
             val msg = MessageActionables(
-                tree = model.tree.toDTO(),
-                actionableIds = model.actionableIds.toSet()
+                tree = model.treeFor(hierarchyId).toDTO(),
+                actionableIds = model.actionableIds(hierarchyId)
             )
             ws.sendMessageActionables(MessageType.actionables, msg)
         }
 
         launch {
-            ws.onSelectedIds.collect { set ->
-                model = model.copyMutable { actionableIds = set.toMutableSet() }
+            // Filed under the hierarchy the editor named rather than over the
+            // whole app: the editor draws one panel per hierarchy and writes a
+            // selection back through the packet it was made in, so a message is
+            // about one container. Laid over everything, picking a row in one
+            // container silently cleared what was picked in every other.
+            ws.onSelectedIds.collect { (treeId, set) ->
+                model = model.copyMutable { setActionableIds(treeId, set) }
             }
         }
         launch {
@@ -3420,8 +3495,15 @@ fun InertiaContainer(
 private inline fun InertiaDataModel.copyMutable(block: InertiaDataModel.() -> Unit): InertiaDataModel {
     val copy = InertiaDataModel(
         containerId = containerId,
-        tree = tree,
-        actionableIds = actionableIds.toMutableSet()
+        // The trees themselves are shared, not copied: a hierarchy is built up
+        // in place by the nodes registering into it, and a copy would leave
+        // every registration made so far behind. The selections are copied, so
+        // a change to one is a new model rather than a mutation Compose cannot
+        // see.
+        trees = trees,
+        actionableIdsByContainer = actionableIdsByContainer
+            .mapValues { (_, ids) -> ids.toMutableSet() }
+            .toMutableMap()
     )
     copy.inertiaSchemas.putAll(inertiaSchemas)
     copy.states.putAll(states)
@@ -3443,6 +3525,7 @@ fun Inertia(
     val guides = LocalInertiaGuides.current
     val handles = LocalInertiaToolHandles.current
     val parentId = LocalInertiaParentId.current
+    val containerId = LocalInertiaContainerId.current
     val isContainer = LocalInertiaIsContainer.current
     val canvasSize = LocalCanvasSize.current
 
@@ -3450,8 +3533,6 @@ fun Inertia(
     /// shares. What playback is keyed by, and what a schema loaded from a project
     /// file is named after.
     val hierarchyIdPrefix = id
-
-    val indexMap = SharedIndexManager.indexMap
     /// This instance's own id: the prefix plus its index among its siblings.
     var instanceId by remember { mutableStateOf<String?>(null) }
     var isSelected by remember { mutableStateOf(false) }
@@ -3473,20 +3554,30 @@ fun Inertia(
 
     val measurement = remember { InertiaNodeMeasurement() }
 
-    LaunchedEffect(hierarchyIdPrefix) {
-        val next = (indexMap[hierarchyIdPrefix] ?: 0)
-        indexMap[hierarchyIdPrefix] = next + 1
-        instanceId = "$hierarchyIdPrefix--$next"
+    /// Claimed once and never re-claimed. `remember` rather than a
+    /// `LaunchedEffect`, which runs again whenever this composable re-enters the
+    /// composition — a tab switch is one — and taking a fresh index each time
+    /// renamed a node that had not moved. Everything already filed under the old
+    /// name — the node in the tree, the selection the editor is holding, the
+    /// measurement — went on naming a view that no longer answered to it.
+    val claimedId = remember(containerId, hierarchyIdPrefix) {
+        SharedIndexManager.claimId(containerId, hierarchyIdPrefix)
     }
 
-    LaunchedEffect(instanceId) {
+    LaunchedEffect(claimedId) {
+        instanceId = claimedId
+    }
+
+    LaunchedEffect(instanceId, containerId) {
         val instance = instanceId ?: return@LaunchedEffect
-        model?.tree?.addRelationship(instance, parentId, isContainer)
+        val container = containerId ?: return@LaunchedEffect
+        // Into this container's own hierarchy — see `InertiaDataModel.trees`.
+        model?.treeFor(container)?.addRelationship(instance, parentId, isContainer)
     }
 
-    LaunchedEffect(instanceId, model?.actionableIds) {
+    LaunchedEffect(instanceId, containerId, model?.actionableIdsByContainer) {
         instanceId?.let { instance ->
-            isSelected = model?.actionableIds?.any { it.hierarchyId == instance } == true
+            isSelected = model?.actionableIds(containerId)?.any { it.hierarchyId == instance } == true
         }
     }
 
@@ -3747,7 +3838,7 @@ fun Inertia(
                     // The whole selection as it stands now, not as it stood when
                     // this gesture's handles were published: an edit is authored
                     // against every node the editor has picked.
-                    actionableIds = m.actionableIds.toSet()
+                    actionableIds = m.actionableIds(containerId)
                 )
             )
         }
@@ -3979,8 +4070,9 @@ fun Inertia(
                     // It was a tap, toggle selection
                     val instance = instanceId
                     val m = currentModel
-                    if (instance != null && m != null) {
-                        val newActionableIds = m.actionableIds.toMutableSet()
+                    val container = containerId
+                    if (instance != null && m != null && container != null) {
+                        val newActionableIds = m.actionableIds(container).toMutableSet()
                         val pair = ActionableIdPair(
                             hierarchyIdPrefix = hierarchyIdPrefix,
                             hierarchyId = instance
@@ -3991,16 +4083,19 @@ fun Inertia(
 
                         // Update UI immediately (like React does)
                         currentUpdateModel { prev ->
-                            prev.copyMutable { actionableIds = newActionableIds }
+                            prev.copyMutable { setActionableIds(container, newActionableIds) }
                         }
 
-                        // Send updated selection to WebSocket
-                        WebSocketClient.shared.sendMessageActionables(MessageType.actionables,
-                            MessageActionables(
-                                tree = m.tree.toDTO(),
-                                actionableIds = newActionableIds.toSet()
+                        // This container's own tree and its own selection — the
+                        // two halves of a `MessageActionables` are read together.
+                        m.treeOrNull(container)?.let { tree ->
+                            WebSocketClient.shared.sendMessageActionables(MessageType.actionables,
+                                MessageActionables(
+                                    tree = tree.toDTO(),
+                                    actionableIds = newActionableIds.toSet()
+                                )
                             )
-                        )
+                        }
                     }
                 }
             }
@@ -4022,20 +4117,23 @@ fun Inertia(
     /// picked, but what *is* picked.
     val toggleShapeSelection = { shape: InertiaShape ->
         val m = currentModel
-        if (m != null) {
-            val next = m.actionableIds.toMutableSet()
+        val container = containerId
+        if (m != null && container != null) {
+            val next = m.actionableIds(container).toMutableSet()
             val pair = ActionableIdPair(
                 hierarchyIdPrefix = hierarchyIdPrefix,
                 hierarchyId = shape.id
             )
             if (!next.remove(pair)) next.add(pair)
 
-            currentUpdateModel { prev -> prev.copyMutable { actionableIds = next } }
+            currentUpdateModel { prev -> prev.copyMutable { setActionableIds(container, next) } }
 
-            WebSocketClient.shared.sendMessageActionables(
-                MessageType.actionables,
-                MessageActionables(tree = m.tree.toDTO(), actionableIds = next.toSet())
-            )
+            m.treeOrNull(container)?.let { tree ->
+                WebSocketClient.shared.sendMessageActionables(
+                    MessageType.actionables,
+                    MessageActionables(tree = tree.toDTO(), actionableIds = next.toSet())
+                )
+            }
         }
     }
 
@@ -4048,7 +4146,7 @@ fun Inertia(
     val shapeEditing = if (model?.isActionable == true && instanceId != null) {
         InertiaShapeEditing(
             isSelected = { shape ->
-                currentModel?.actionableIds?.any { it.hierarchyId == shape.id } == true
+                currentModel?.actionableIds(containerId)?.any { it.hierarchyId == shape.id } == true
             },
             tool = tool,
             outerValues = sample,
