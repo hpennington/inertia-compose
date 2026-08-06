@@ -690,6 +690,24 @@ class Tree(val id: String) {
     var rootNode: Node? = null
     val nodeMap: MutableMap<String, Node> = mutableMapOf()
 
+    /// How many times the shape of this hierarchy has changed.
+    ///
+    /// A hierarchy is not built in one go: each node registers itself as it
+    /// enters the composition, which is after whoever would send the tree has
+    /// run. Something has to say when the tree became worth sending again, and
+    /// the alternative — sending only when the socket opens — is what left the
+    /// editor drawing an empty panel for a container it had never been told
+    /// about.
+    ///
+    /// Snapshot state, so a composable that reads it is recomposed when it
+    /// moves. Only ever written from an effect, never from composition.
+    var revision by mutableIntStateOf(0)
+        private set
+
+    private fun changed() {
+        revision += 1
+    }
+
     /// Files a node under its parent, and is safe to call again for a node this
     /// tree already holds.
     ///
@@ -699,21 +717,67 @@ class Tree(val id: String) {
     /// the parent two children with one id, so the hierarchy the editor drew
     /// listed the node twice while only one of the rows answered to the
     /// selection.
+    ///
+    /// A call that changes nothing moves nothing: the registration effect runs
+    /// again for reasons of its own, and a revision that moved every time would
+    /// put the same tree on the wire on every recomposition.
     fun addRelationship(id: String, parentId: String?, parentIsContainer: Boolean = false) {
+        var didChange = false
+
         val current = nodeMap.getOrPut(id) {
+            didChange = true
             Node(id, parentId).also { it.tree = this }
         }
         if (parentId != null) {
             val parent = nodeMap.getOrPut(parentId) {
+                didChange = true
                 Node(parentId).also { it.tree = this }
             }
             if (parent.children.none { it.id == id }) {
                 parent.addChild(current)
+                didChange = true
             }
             if (parentIsContainer || (rootNode == null && parent.parent == null)) {
+                if (rootNode !== parent) didChange = true
                 rootNode = parent
             }
         }
+
+        if (didChange) changed()
+    }
+
+    /// Drops a node and everything under it.
+    ///
+    /// A hierarchy describes what is on screen, and on this runtime a view that
+    /// goes away is *gone* — a tab that is not the selected one leaves the
+    /// composition rather than being kept alive off screen the way SwiftUI's
+    /// `TabView` keeps it. Without this the tree only ever grew: the editor went
+    /// on listing every view the app had ever shown in that container, and a row
+    /// for one of them selected a node nothing would answer for.
+    ///
+    /// The subtree goes with it because that is what leaving the composition
+    /// does — a child removes itself too, and whichever of the two runs first,
+    /// the other finds nothing left to do.
+    fun removeNode(id: String) {
+        val node = nodeMap[id] ?: return
+
+        node.parentId?.let { nodeMap[it] }?.children?.removeAll { it.id == id }
+
+        val stack = ArrayDeque(listOf(node))
+        while (stack.isNotEmpty()) {
+            val current = stack.removeLast()
+            nodeMap.remove(current.id)
+            current.children.forEach { stack.addLast(it) }
+        }
+
+        node.parent = null
+        // The hierarchy has no root left to draw from rather than one naming a
+        // node that is no longer in it.
+        if (rootNode?.let { !nodeMap.containsKey(it.id) } == true) {
+            rootNode = null
+        }
+
+        changed()
     }
 
     fun toDTO(): TreeDTO {
@@ -3226,6 +3290,9 @@ private val LocalCanvasSize = compositionLocalOf<IntSize> { IntSize.Zero }
 
 object SharedIndexManager {
     val indexMap: MutableMap<String, Int> = mutableMapOf()
+    /// Indices handed back by nodes that have left the composition, per counter
+    /// — see [releaseId].
+    private val freeIndices: MutableMap<String, MutableSet<Int>> = mutableMapOf()
     val objectIndexMap: MutableMap<String, Int> = mutableMapOf()
     val objectIdSet: MutableSet<String> = mutableSetOf()
 
@@ -3238,14 +3305,83 @@ object SharedIndexManager {
     /// the second container's node come up as `card0--1` with no `card0--0`
     /// beside it, so a selection authored against the first container named
     /// nothing the second one drew.
+    /// A released index is handed out again before a fresh one is taken, so a
+    /// container gives the same names to the same views every time it draws
+    /// them — see [releaseId].
     fun claimId(containerId: String?, prefix: String): String {
-        // Separated, or container `ab` with prefix `c` and container `a` with
-        // prefix `bc` would share a counter.
-        val key = "${containerId.orEmpty()}$prefix"
+        val key = key(containerId, prefix)
+
+        val free = freeIndices[key]
+        if (free != null && free.isNotEmpty()) {
+            val index = free.min()
+            free.remove(index)
+            return "$prefix--$index"
+        }
+
         val index = indexMap[key] ?: 0
         indexMap[key] = index + 1
         return "$prefix--$index"
     }
+
+    /// Gives an index back, for the next view of this prefix in this container
+    /// to take.
+    ///
+    /// The counter alone only ever climbs, and on this runtime a view that goes
+    /// off screen leaves the composition rather than being kept alive the way
+    /// SwiftUI's `TabView` keeps a tab that is not the selected one — so a tab
+    /// visited a second time had its cards come back as `card0--1` and
+    /// `card1--1`. Everything the editor holds is filed under the name the node
+    /// had the first time: its row in the hierarchy, the selection, the mapping
+    /// from actionable to animation. The second visit drew views the editor had
+    /// never heard of, in a hierarchy still listing rows nothing on screen
+    /// answered to.
+    fun releaseId(containerId: String?, prefix: String, id: String) {
+        val separator = "$prefix--"
+        if (!id.startsWith(separator)) return
+
+        val index = id.removePrefix(separator).toIntOrNull() ?: return
+        freeIndices.getOrPut(key(containerId, prefix)) { mutableSetOf() }.add(index)
+    }
+
+    /// Separated, or container `ab` with prefix `c` and container `a` with
+    /// prefix `bc` would share a counter.
+    private fun key(containerId: String?, prefix: String): String =
+        "${containerId.orEmpty()}$prefix"
+}
+
+/// One node's claim on an index, held for as long as the `remember` that made it
+/// is remembered.
+///
+/// A [RememberObserver] rather than a claim taken in composition and given back
+/// from a [DisposableEffect], because the index has to be taken *after* the
+/// nodes leaving in the same pass have given theirs back — and composition runs
+/// before any of that. Compose dispatches this the other way round: every
+/// `onForgotten` first, then every `onRemembered`. So a screen replaced by
+/// another within one recomposition hands its indices over rather than leaving
+/// the new one to take fresh ones.
+///
+/// The id is snapshot state because of that: it does not exist yet while the
+/// node is first composed, and the composable is recomposed with it once it
+/// does.
+private class ClaimedInstanceId(
+    private val containerId: String?,
+    private val prefix: String
+) : RememberObserver {
+    var id by mutableStateOf<String?>(null)
+        private set
+
+    override fun onRemembered() {
+        id = SharedIndexManager.claimId(containerId, prefix)
+    }
+
+    override fun onForgotten() {
+        id?.let { SharedIndexManager.releaseId(containerId, prefix, it) }
+        id = null
+    }
+
+    /// A composition that was thrown away rather than applied never got as far
+    /// as `onRemembered`, so there is nothing to give back.
+    override fun onAbandoned() {}
 }
 
 // ========== COMPOSABLES ==========
@@ -3335,16 +3471,7 @@ fun InertiaContainer(
         // in `baseURL`.
         InertiaLog.debug("connecting to $baseURL")
 
-        ws.connect(url = baseURL) {
-            // This container's own tree and its own selection, never the app's:
-            // the two halves of a `MessageActionables` are read together, and
-            // the editor files what it is told under the tree that came with it.
-            val msg = MessageActionables(
-                tree = model.treeFor(hierarchyId).toDTO(),
-                actionableIds = model.actionableIds(hierarchyId)
-            )
-            ws.sendMessageActionables(MessageType.actionables, msg)
-        }
+        ws.connect(url = baseURL)
 
         launch {
             // Filed under the hierarchy the editor named rather than over the
@@ -3412,6 +3539,54 @@ fun InertiaContainer(
                 guides.hide()
             }
         }
+    }
+
+    /// The hierarchy this container is currently building, and what the editor
+    /// draws its panel from.
+    ///
+    /// Read here rather than inside the effect below so this composable is
+    /// subscribed to [Tree.revision]: a hierarchy is not built in one go — each
+    /// actionable registers as it enters the composition, which is after this
+    /// container's effects have run — so a message sent only when the socket
+    /// opens carried whatever had registered by then. With a container whose
+    /// `hierarchyId` changes, that is nothing at all: the tab being opened has
+    /// its own empty tree at that moment, and the editor was left drawing the
+    /// panel for a hierarchy it was never told the contents of.
+    val tree = model.treeFor(hierarchyId)
+    val revision = tree.revision
+
+    LaunchedEffect(dev, hierarchyId, revision) {
+        if (!dev) return@LaunchedEffect
+
+        // This container's own tree and its own selection, never the app's: the
+        // two halves of a `MessageActionables` are read together, and the editor
+        // files what it is told under the tree that came with it.
+        WebSocketClient.shared.sendMessageActionables(
+            MessageType.actionables,
+            MessageActionables(
+                tree = tree.toDTO(),
+                actionableIds = model.actionableIds(hierarchyId)
+            )
+        )
+    }
+
+    /// An editor that attaches later missed everything said before it was
+    /// listening, and the hierarchy will not change again just because one
+    /// turned up. `connect` re-arms its own callback without running it when the
+    /// socket is already up, so this is what covers a reconnect as well.
+    DisposableEffect(dev, hierarchyId) {
+        if (!dev) return@DisposableEffect onDispose { }
+
+        val remove = WebSocketClient.shared.addConnectedListener {
+            WebSocketClient.shared.sendMessageActionables(
+                MessageType.actionables,
+                MessageActionables(
+                    tree = tree.toDTO(),
+                    actionableIds = model.actionableIds(hierarchyId)
+                )
+            )
+        }
+        onDispose { remove() }
     }
 
     // The editor's playhead has no other way to know where the animation is.
@@ -3554,25 +3729,48 @@ fun Inertia(
 
     val measurement = remember { InertiaNodeMeasurement() }
 
-    /// Claimed once and never re-claimed. `remember` rather than a
-    /// `LaunchedEffect`, which runs again whenever this composable re-enters the
-    /// composition — a tab switch is one — and taking a fresh index each time
-    /// renamed a node that had not moved. Everything already filed under the old
-    /// name — the node in the tree, the selection the editor is holding, the
-    /// measurement — went on naming a view that no longer answered to it.
-    val claimedId = remember(containerId, hierarchyIdPrefix) {
-        SharedIndexManager.claimId(containerId, hierarchyIdPrefix)
+    /// Held for as long as this node is composed in this container, and handed
+    /// back when it is not.
+    ///
+    /// The index used to be claimed in a plain `remember` and never given back,
+    /// which keeps the name still only for as long as the composable stays in
+    /// the composition — and a tab that is not the selected one does not. The
+    /// counter simply climbed, and a tab that had been away came back under ids
+    /// the editor had never been told about.
+    ///
+    /// Releasing is what keeps the name still instead: a [RememberObserver] ties
+    /// the claim to exactly the lifetime of the `remember` that made it, so the
+    /// index goes back to the container it was taken from the moment this node
+    /// leaves — and the next view of this prefix to be composed there, which on
+    /// a tab switched back to is this same view, takes it again.
+    val claim = remember(containerId, hierarchyIdPrefix) {
+        ClaimedInstanceId(containerId, hierarchyIdPrefix)
     }
+    val claimedId = claim.id
 
     LaunchedEffect(claimedId) {
-        instanceId = claimedId
+        instanceId = claimedId ?: return@LaunchedEffect
     }
 
-    LaunchedEffect(instanceId, containerId) {
-        val instance = instanceId ?: return@LaunchedEffect
-        val container = containerId ?: return@LaunchedEffect
+    /// This node's place in its container's hierarchy, for as long as it is in
+    /// it.
+    ///
+    /// Taken out again on the way off screen: this runtime drops a view that is
+    /// not on the selected tab rather than keeping it alive, so a hierarchy that
+    /// only ever grew described an app that no longer existed — see
+    /// [Tree.removeNode].
+    DisposableEffect(instanceId, containerId) {
+        val instance = instanceId
+        val container = containerId
+        if (instance == null || container == null) {
+            return@DisposableEffect onDispose { }
+        }
+
         // Into this container's own hierarchy — see `InertiaDataModel.trees`.
-        model?.treeFor(container)?.addRelationship(instance, parentId, isContainer)
+        val tree = model?.treeFor(container)
+        tree?.addRelationship(instance, parentId, isContainer)
+
+        onDispose { tree?.removeNode(instance) }
     }
 
     LaunchedEffect(instanceId, containerId, model?.actionableIdsByContainer) {
