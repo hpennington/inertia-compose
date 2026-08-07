@@ -1046,6 +1046,21 @@ internal const val INERTIA_FILE_EXTENSION = "inertia"
 
 // ========== WEBSOCKET CLIENT ==========
 
+/// Where to find the editor. `adb reverse` — which the editor sets up for the
+/// device it launches on — makes the device's own loopback reach the editor
+/// process on the Mac, so the default holds for an emulator and for a device on
+/// USB alike. A runtime reached over the network instead needs the Mac's address
+/// on the local network: hand it to [WebSocketClient.setEndpoint] before the
+/// first container composes.
+///
+/// Matches the Swift runtime's `inertiaDefaultHost`.
+val inertiaDefaultHost: String = "127.0.0.1"
+
+/// The port the editor's Compose listener is on, matching the editor's
+/// `RuntimePort.compose`. The three runtimes get a listener each — SwiftUI 8060,
+/// Compose 8070, React 8080 — so this is not the Swift runtime's port.
+val inertiaDefaultPort: Int = 8070
+
 class WebSocketClient private constructor() : WebSocketListener() {
     companion object {
         val shared: WebSocketClient by lazy { WebSocketClient() }
@@ -1090,6 +1105,44 @@ class WebSocketClient private constructor() : WebSocketListener() {
     @Volatile
     var isConnected: Boolean = false
         private set
+
+    /// Where [InertiaContainer] dials when it is not told otherwise, built from
+    /// [inertiaDefaultHost] and [inertiaDefaultPort].
+    ///
+    /// Held here rather than taken as a container parameter so that reaching an
+    /// editor on another host is a one-line change in the app rather than an
+    /// argument every container in it has to repeat — and so that the endpoint
+    /// cannot differ between two containers dialing the same single socket.
+    @Volatile
+    var editorURL: String = "ws://$inertiaDefaultHost:$inertiaDefaultPort"
+        private set
+
+    /// Points the runtime at an editor somewhere other than loopback — the Mac's
+    /// address on the local network, for a device that is not tunnelled through
+    /// `adb reverse`. The equivalent of the Swift runtime's
+    /// `setEnabled(_:host:port:)`.
+    ///
+    /// Takes effect on the next dial, so an app that needs it should call this
+    /// before its first container composes; called later, it moves a connection
+    /// that is already up the same way [connect] with a new url does.
+    fun setEndpoint(host: String = inertiaDefaultHost, port: Int = inertiaDefaultPort) {
+        val next = "ws://$host:$port"
+
+        val shouldDial = synchronized(connectionLock) {
+            if (next == editorURL) return
+            editorURL = next
+
+            // Nothing has dialed yet, so there is no connection to move: the
+            // first container to compose reads [editorURL] on its way into
+            // [connect] and picks this up on its own.
+            if (url == null) return
+
+            moveTo(next)
+            true
+        }
+
+        if (shouldDial) dial()
+    }
 
     /// The editor's selection, with the id of the hierarchy it was made in.
     ///
@@ -1137,28 +1190,33 @@ class WebSocketClient private constructor() : WebSocketListener() {
         return { synchronized(connectionLock) { connectedListeners.remove(listener) } }
     }
 
-    fun connect(url: String, onConnect: () -> Unit = {}) {
+    fun connect(url: String = editorURL, onConnect: () -> Unit = {}) {
         val shouldDial = synchronized(connectionLock) {
             onConnected = onConnect
 
-            if (url != this.url) {
-                // The endpoint moved, so whatever is open or scheduled belongs to
-                // the old one. Dropping the socket here means its own callback
-                // finds itself stale and leaves the redial below alone.
-                this.url = url
-                reconnectJob?.cancel()
-                reconnectJob = null
-                reconnectAttempt = 0
-                socket?.close(normalClosureStatus, null)
-                socket = null
-                isConnected = false
-                isDialing = false
-            }
+            if (url != this.url) moveTo(url)
 
             !isConnected && !isDialing && reconnectJob == null
         }
 
         if (shouldDial) dial()
+    }
+
+    /// Points the client at [next], letting go of everything that belonged to
+    /// the endpoint it was on: a socket that is open or in flight, and a redial
+    /// waiting out its backoff. Dropping the socket here means its own callback
+    /// finds itself stale and leaves the redial to the caller.
+    ///
+    /// Called with [connectionLock] held.
+    private fun moveTo(next: String) {
+        url = next
+        reconnectJob?.cancel()
+        reconnectJob = null
+        reconnectAttempt = 0
+        socket?.close(normalClosureStatus, null)
+        socket = null
+        isConnected = false
+        isDialing = false
     }
 
     private fun dial() {
@@ -3625,7 +3683,6 @@ fun InertiaContainer(
     dev: Boolean,
     id: String,
     hierarchyId: String,
-    baseURL: String,
     content: @Composable () -> Unit
 ) {
     var model by remember {
@@ -3658,7 +3715,7 @@ fun InertiaContainer(
 
     /// Outside the editor the schemas come from the shipped animation file
     /// rather than the socket, the way the SwiftUI runtime reads
-    /// `<id>.inertia` from its bundle and the React runtime fetches it from
+    /// `<id>.inertia` from its bundle and the React runtime fetches it from its
     /// `baseURL`. A missing or unreadable file leaves the actionables at their
     /// layout positions rather than bringing the app down — a broken animation
     /// is not worth a crash.
@@ -3688,7 +3745,7 @@ fun InertiaContainer(
         }
     }
 
-    LaunchedEffect(dev, hierarchyId, baseURL) {
+    LaunchedEffect(dev, hierarchyId) {
         // Nothing but the editor is on the other end of this socket, so a
         // shipped build does not open one. The SwiftUI runtime gates its
         // channel on `dev` and the React runtime returns before connecting.
@@ -3696,14 +3753,16 @@ fun InertiaContainer(
 
         val ws = WebSocketClient.shared
 
-        // The URL the app passed, as passed. This used to rewrite `127.0.0.1` to
-        // a hardcoded address for one particular emulator network, which is not
-        // something the runtime can know — an app that needs a different host
-        // (`10.0.2.2` from a stock emulator, a LAN address from a device) says so
-        // in `baseURL`.
-        InertiaLog.debug("connecting to $baseURL")
+        // Where the editor is, which the app is not asked to know: the port is
+        // the runtime's own, and the host is loopback because the editor tunnels
+        // it there with `adb reverse`. An app that has to reach an editor
+        // somewhere else moves it once, through
+        // [WebSocketClient.setEndpoint] — this effect is not keyed on the
+        // endpoint, so the move is that call's to carry out, not a
+        // recomposition's.
+        InertiaLog.debug("connecting to ${ws.editorURL}")
 
-        ws.connect(url = baseURL)
+        ws.connect()
 
         launch {
             // Filed under the hierarchy the editor named rather than over the
