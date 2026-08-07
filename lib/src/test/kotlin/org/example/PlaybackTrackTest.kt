@@ -214,6 +214,11 @@ class PlaybackTrackTest {
             AnimationSignal.SetLoopDuration(4.5f),
             decode("81af7365744c6f6f704475726174696f6e81a25f30ca40900000")
         )
+        // {"trigger": {"_0": "card0"}}
+        assertEquals(
+            AnimationSignal.Trigger("card0"),
+            decode("81a77472696767657281a25f30a56361726430")
+        )
         // {"somethingElse": {}}
         assertNull(decode("81ad736f6d657468696e67456c736580"))
     }

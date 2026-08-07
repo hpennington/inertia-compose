@@ -421,7 +421,17 @@ data class AnimationContainer(
 data class InertiaAnimationState(
     val id: String,
     val trigger: Boolean? = null,
-    val isCancelled: Boolean = false
+    val isCancelled: Boolean = false,
+    /// Where the track is frozen after a triggered run has had its pass, in
+    /// seconds into the loop — null while the animation is waiting, running, or
+    /// being scrubbed.
+    ///
+    /// Ending a pass clears [trigger], so the animation can be asked for again;
+    /// on its own that would also take the node back to its initial values,
+    /// since nothing but a running track draws anywhere else. It stays where the
+    /// run left it instead, which is this: the frame it was showing when the
+    /// pass ended, held until it is triggered again.
+    val heldTime: Float? = null
 )
 
 class InertiaDataModel(
@@ -852,12 +862,18 @@ data class MessagePlaybackProgress(
 /// The editor's transport commands.
 sealed interface AnimationSignal {
     data object Pause : AnimationSignal
+    /// The editor's play button. Starts the animations that start themselves —
+    /// the `auto` ones. A `trigger` animation is the app's to start and goes on
+    /// waiting, exactly as it would with no editor attached.
     data object Resume : AnimationSignal
     /// The playhead was moved by hand; hold the animation this many seconds
     /// into the loop.
     data class Seek(val time: Float) : AnimationSignal
     /// The editor's timeline was resized; play one loop over this many seconds.
     data class SetLoopDuration(val duration: Float) : AnimationSignal
+    /// The editor's Trigger action on the named animation, standing in for the
+    /// [trigger] call the app would make.
+    data class Trigger(val id: String) : AnimationSignal
 }
 
 /// One case of a Swift enum as it arrives: the associated value under `_0`, or
@@ -865,6 +881,12 @@ sealed interface AnimationSignal {
 @Serializable
 data class AnimationSignalCaseDTO(
     @SerialName("_0") val value: Float = 0f
+)
+
+/// The same, for a case whose associated value is an id rather than a number.
+@Serializable
+data class AnimationSignalIdCaseDTO(
+    @SerialName("_0") val value: String = ""
 )
 
 /// Swift synthesizes `Codable` for an enum with associated values as a
@@ -876,7 +898,8 @@ data class AnimationSignalDTO(
     val pause: AnimationSignalCaseDTO? = null,
     val resume: AnimationSignalCaseDTO? = null,
     val seek: AnimationSignalCaseDTO? = null,
-    val setLoopDuration: AnimationSignalCaseDTO? = null
+    val setLoopDuration: AnimationSignalCaseDTO? = null,
+    val trigger: AnimationSignalIdCaseDTO? = null
 )
 
 @Serializable
@@ -894,6 +917,7 @@ internal fun decodeAnimationSignal(raw: AnimationSignalDTO?): AnimationSignal? {
     if (raw.resume != null) return AnimationSignal.Resume
     raw.seek?.let { return AnimationSignal.Seek(it.value) }
     raw.setLoopDuration?.let { return AnimationSignal.SetLoopDuration(it.value) }
+    raw.trigger?.let { return AnimationSignal.Trigger(it.value) }
 
     return null
 }
@@ -2187,10 +2211,15 @@ class InertiaPlaybackController internal constructor() {
     /// — the same shared clock that makes a trigger mid-run join the run in
     /// progress instead of restarting it.
     fun restart(id: String) {
-        markTriggered(id)
-
         stopClock()
         playheadTime = 0f
+
+        // The playhead is back at zero, which ends the pass of anything else
+        // that was triggered — the same rule as everywhere else, so a restart
+        // does not quietly carry another animation's run over the boundary.
+        retireTriggeredAnimations(holdingAt = 0f)
+
+        markTriggered(id)
         seekTime = null
         startClock()
     }
@@ -2209,9 +2238,8 @@ class InertiaPlaybackController internal constructor() {
     /// [trigger] call a `trigger` animation is still waiting for, and starting
     /// one here played animations the app had said it would start itself. Those
     /// are returned to their initial values instead, so the screen offers them
-    /// from the top when the app does trigger them. The editor's play button
-    /// does stand in for the app, which is what [isEditorPlaying] keeps true
-    /// here.
+    /// from the top when the app does trigger them — the editor's Trigger action
+    /// included, which is a [trigger] call like any other.
     ///
     /// A cancellation goes with the screen that was cancelled on: the app's next
     /// [trigger] on this one is answered rather than dropped.
@@ -2234,7 +2262,7 @@ class InertiaPlaybackController internal constructor() {
         // actionable arriving on that screen has a track here before it has
         // registered.
         (registered.keys + schemas.keys).toList().forEach { prefix ->
-            val isAuto = invokeTypeOf(prefix) == InertiaAnimationInvokeType.auto || isEditorPlaying
+            val isAuto = invokeTypeOf(prefix) == InertiaAnimationInvokeType.auto
 
             states[prefix] = InertiaAnimationState(
                 id = prefix,
@@ -2299,7 +2327,10 @@ class InertiaPlaybackController internal constructor() {
         // [isEditorAttached]. An actionable that appears mid-run under a playing
         // editor still joins it, which is what the second half says.
         if (isEditorAttached && !isEditorPlaying) return
-        if (invokeType != InertiaAnimationInvokeType.auto && !isEditorPlaying) return
+        // A `trigger` animation waits for the app whoever is watching — the
+        // editor's play button is a request about the timeline, and standing in
+        // for the app is its Trigger action's job.
+        if (invokeType != InertiaAnimationInvokeType.auto) return
         if (states.containsKey(hierarchyIdPrefix)) return
 
         markTriggered(hierarchyIdPrefix)
@@ -2317,6 +2348,31 @@ class InertiaPlaybackController internal constructor() {
         return state.trigger == true && !state.isCancelled
     }
 
+    /// Where to read [hierarchyIdPrefix]'s track, or null when its run is not on
+    /// screen at all and the animation is drawn at the values it starts from.
+    ///
+    /// The one answer to both halves of that question, so whether a track shows
+    /// and where it has got to can never disagree. Three states in it: a run on
+    /// screen — playing, or parked in the track by the editor — reads at the
+    /// playhead; a triggered run that has had its pass holds the frame it ended
+    /// on, whatever the playhead does afterwards, until it is triggered again;
+    /// anything else is not drawn from its track.
+    ///
+    /// The same call as the SwiftUI runtime's `InertiaDataModel.trackTime(for:)`
+    /// and the React runtime's `InertiaPlaybackController.trackTime()`.
+    internal fun trackTime(hierarchyIdPrefix: String): Float? {
+        val state = states[hierarchyIdPrefix] ?: return null
+        if (state.isCancelled) return null
+
+        state.heldTime?.let { return it }
+
+        // Scrubbing shows the animation without running it.
+        if (state.trigger != true) return null
+        if (!isRunning && seekTime == null) return null
+
+        return seekTime ?: playheadTime
+    }
+
     // MARK: - Editor signals
 
     internal fun applySignal(signal: AnimationSignal, sequence: Int) {
@@ -2330,27 +2386,37 @@ class InertiaPlaybackController internal constructor() {
             is AnimationSignal.SetLoopDuration -> {
                 loopDuration = InertiaPlayback.clampLoopDuration(signal.duration)
             }
+            // The app's own entry point, reached by the editor's Trigger action
+            // standing in for the app — a `trigger` animation starts the one way
+            // whoever is watching it in the editor is authoring it to start.
+            is AnimationSignal.Trigger -> trigger(signal.id)
         }
     }
 
     /// Stops the run and reports where it stopped, so a paused playhead sits
-    /// exactly where the animation froze.
+    /// exactly where the animation froze — for the `auto` animations. A
+    /// triggered one has had its pass ended by the transport being touched at
+    /// all, so it holds the frame it is on until it is asked for again.
     private fun pausePlayback() {
         isEditorPlaying = false
+        retireTriggeredAnimations(holdingAt = playheadTime)
         stopClock()
         seekTime = playheadTime
         report(isRunning = false)
     }
 
-    /// The editor's play button: runs every animation, whatever its `invokeType`,
-    /// picking a paused or scrubbed run back up where it was left.
+    /// The editor's play button: picks a paused or scrubbed run back up where it
+    /// was left, and starts the animations that start themselves.
     ///
-    /// A `trigger` animation is waiting on the app to call [trigger], which is not
-    /// something the app does while its animation is being authored, so the editor
-    /// stands in for the app here. Signals only ever come from the editor, so the
-    /// same animation running without the editor attached still waits for its
-    /// trigger.
+    /// The `auto` ones. A `trigger` animation goes on waiting for the app to call
+    /// [trigger] — and one that was mid-pass is put back to waiting, since pressing
+    /// play is asking for the run the timeline describes rather than for the one a
+    /// trigger asked for. Standing in for the app is the editor's Trigger action's
+    /// job, and it arrives as [AnimationSignal.Trigger] rather than riding along
+    /// with this.
     private fun resumePlayback() {
+        val wasRunning = isRunning
+
         isEditorPlaying = true
         // Unparked before the bail-out below: a play following a pause has to
         // release the playhead even when the actionables it applies to have not
@@ -2358,16 +2424,26 @@ class InertiaPlaybackController internal constructor() {
         // start the run.
         seekTime = null
 
-        // Every registered prefix, not just the ones with state: a `trigger`
-        // animation waiting on the app has none, and it is exactly what the
-        // editor's play button is here to start.
-        registered.keys.toList().forEach { prefix ->
-            if (states[prefix]?.isCancelled != true) markTriggered(prefix)
+        retireTriggeredAnimations(holdingAt = playheadTime)
+
+        // Every registered prefix and every schema, not just the ones with
+        // state: an `auto` animation whose actionable has not entered the
+        // composition yet is still one this is here to start.
+        (registered.keys + schemas.keys).toList().forEach { prefix ->
+            if (invokeTypeOf(prefix) != InertiaAnimationInvokeType.auto) return@forEach
+            if (states[prefix]?.isCancelled == true) return@forEach
+
+            markTriggered(prefix)
         }
 
-        // Nothing to play yet: whatever registers after this will start itself,
-        // which is where the race above is settled.
-        if (!hasTriggeredActionable) return
+        // Nothing to play: either whatever registers after this will start
+        // itself, which is where the race above is settled, or everything here
+        // is waiting on a trigger this is not — worth saying if it means a run
+        // just ended.
+        if (!hasTriggeredActionable) {
+            if (wasRunning) report(isRunning = false)
+            return
+        }
 
         startClock()
     }
@@ -2379,6 +2455,11 @@ class InertiaPlaybackController internal constructor() {
         stopClock()
 
         val clamped = time.coerceIn(0f, playbackDuration)
+
+        // Back at the start of the timeline, which is where a pass ends however
+        // the playhead got there — see [retireTriggeredAnimations].
+        if (clamped == 0f) retireTriggeredAnimations(holdingAt = 0f)
+
         seekTime = clamped
         playheadTime = clamped
     }
@@ -2395,6 +2476,38 @@ class InertiaPlaybackController internal constructor() {
     /// says it plays on its own.
     private fun invokeTypeOf(hierarchyIdPrefix: String): InertiaAnimationInvokeType? =
         registered[hierarchyIdPrefix] ?: schemas[hierarchyIdPrefix]?.invokeType
+
+    /// Puts the `trigger` animations that have played their pass back to
+    /// waiting, holding each where [holdingAt] leaves it.
+    ///
+    /// A trigger is answered once. The run it asked for ends when the playhead
+    /// goes back to zero — the loop coming round, or the transport being touched
+    /// — and the animation has to be asked for again, rather than repeating for
+    /// as long as the screen is up with a second [trigger] left with nothing to
+    /// do.
+    ///
+    /// What ends is the run, not what is on screen: [InertiaAnimationState.heldTime]
+    /// is the frame the animation was showing at that moment, and it stays on it
+    /// until the next trigger replays it. Every caller passes the playhead the
+    /// node is drawn at, so nothing moves at the instant a pass ends.
+    ///
+    /// The clock goes down with the last thing running off it, the same as a
+    /// cancellation. Reporting that is left to the caller, each of which is
+    /// about to say something about the run anyway.
+    private fun retireTriggeredAnimations(holdingAt: Float) {
+        states.keys.toList().forEach { prefix ->
+            if (invokeTypeOf(prefix) != InertiaAnimationInvokeType.trigger) return@forEach
+
+            val state = states[prefix] ?: return@forEach
+            if (state.trigger != true) return@forEach
+
+            states[prefix] = state.copy(trigger = false, heldTime = holdingAt)
+        }
+
+        if (hasTriggeredActionable) return
+
+        stopClock()
+    }
 
     private fun markTriggered(hierarchyIdPrefix: String) {
         states[hierarchyIdPrefix] = InertiaAnimationState(
@@ -2459,7 +2572,9 @@ class InertiaPlaybackController internal constructor() {
 
         // A run that plays once ends here, holding its final frame: the clock
         // stops but the run stays on screen, which is what `isRunning` says.
-        // Starting it again is the app's call.
+        // Starting it again is the app's call. Nothing retires here, because the
+        // playhead stops at the end of the loop rather than coming back round to
+        // the start of it.
         if (!isRepeating && elapsed >= duration) {
             playheadTime = duration
             isTicking = false
@@ -2468,7 +2583,22 @@ class InertiaPlaybackController internal constructor() {
             return
         }
 
-        playheadTime = if (duration > 0f) elapsed % duration else 0f
+        val wrapped = if (duration > 0f) elapsed % duration else 0f
+
+        // The timeline has come round, so whatever was triggered has had the
+        // pass it was triggered for. Held at the end of the loop, which is the
+        // frame it is on as it comes round.
+        if (wrapped < playheadTime) {
+            retireTriggeredAnimations(holdingAt = duration)
+
+            if (!isTicking) {
+                playheadTime = wrapped
+                report(isRunning = false)
+                return
+            }
+        }
+
+        playheadTime = wrapped
         report(isRunning = true)
     }
 
@@ -4006,16 +4136,16 @@ fun Inertia(
     /// run, and on every pointer event of every gesture.
     val sample = {
         // Playback is keyed by prefix, so every actionable authored against the
-        // same id runs off the one the app started.
-        val isPlayable = animation != null && playback.isPlaying(hierarchyIdPrefix)
-        // Scrubbing shows the animation without running it, which is why a
-        // parked playhead draws the same way a running one does.
-        val isShowingTrack = isPlayable && (playback.isRunning || playback.seekTime != null)
+        // same id runs off the one the app started. Scrubbing shows the
+        // animation without running it and a finished pass holds the frame it
+        // ended on, which is why one read answers all three — see
+        // [InertiaDataModel.trackTime].
+        val trackTime = playback.trackTime(hierarchyIdPrefix)
 
         val base = when {
             animation == null -> InertiaAnimationValues()
-            isShowingTrack -> animation.valuesAtTime(
-                playback.playheadTime,
+            trackTime != null -> animation.valuesAtTime(
+                trackTime,
                 playback.playbackDuration,
                 playback.isRepeating
             )
@@ -4517,7 +4647,9 @@ fun Inertia(
         // of plain backdrops recomposes exactly as often as it did before this
         // existed.
         val hasTimedShapes = shapes.any { !it.showsBeforeAnimation }
-        val isTriggered = hasTimedShapes && playback.isPlaying(hierarchyIdPrefix)
+        // A shape goes with the actionable it backs, held frame and all: the
+        // frame the actionable is holding is the one the shape was drawn on.
+        val isShowingTrack = hasTimedShapes && playback.trackTime(hierarchyIdPrefix) != null
         val isPlaying = hasTimedShapes && (playback.isRunning || playback.seekTime != null)
 
         // The shape being worked on stays drawn whatever it says: selection
@@ -4528,7 +4660,8 @@ fun Inertia(
         val drawnShapes = shapes.filter { shape ->
             shape.showsBeforeAnimation
                 || shapeEditing?.isSelected(shape) == true
-                || ((isTriggered || shape.animation?.invokeType == InertiaAnimationInvokeType.auto) && isPlaying)
+                || isShowingTrack
+                || (shape.animation?.invokeType == InertiaAnimationInvokeType.auto && isPlaying)
         }
 
         val hasCanvas = drawnShapes.isNotEmpty() && layoutSize != IntSize.Zero

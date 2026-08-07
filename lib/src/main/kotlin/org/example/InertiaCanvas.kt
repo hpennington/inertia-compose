@@ -672,15 +672,21 @@ private fun shapeSample(
         val base = if (animation == null) {
             InertiaAnimationValues()
         } else {
-            val isTriggered = hierarchyIdPrefix?.let { playback.isPlaying(it) } == true
-            val isPlayable = isTriggered || animation.invokeType == InertiaAnimationInvokeType.auto
-            // Scrubbing shows the animation without running it, which is why a
-            // parked playhead draws the same way a running one does.
-            val isShowingTrack = isPlayable && (playback.isRunning || playback.seekTime != null)
+            // The actionable's own read, held frame and all — a shape is drawn on
+            // the frame the actionable it backs is drawn on. A shape carrying an
+            // `auto` track of its own runs as soon as the clock does, even while
+            // that actionable is still waiting to be triggered, and is scrubbed
+            // with the playhead like anything else.
+            val isPlaying = playback.isRunning || playback.seekTime != null
+            val playheadTime = playback.seekTime ?: playback.playheadTime
+            val trackTime = hierarchyIdPrefix?.let { playback.trackTime(it) }
+                ?: playheadTime.takeIf {
+                    animation.invokeType == InertiaAnimationInvokeType.auto && isPlaying
+                }
 
-            if (isShowingTrack) {
+            if (trackTime != null) {
                 animation.valuesAtTime(
-                    playback.playheadTime,
+                    trackTime,
                     playback.playbackDuration,
                     playback.isRepeating
                 )
