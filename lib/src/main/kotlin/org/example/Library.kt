@@ -2204,11 +2204,17 @@ class InertiaPlaybackController internal constructor() {
     /// call as the SwiftUI runtime's `InertiaDataModel.restartAll()` and the
     /// React runtime's `InertiaPlaybackController.restartAll()`.
     ///
-    /// Every animation, whatever its `invokeType` and whether or not it was
-    /// cancelled — the same breadth as the editor's play button, for the same
-    /// reason [restart] clears a cancellation: arriving on a screen is a decision
-    /// to show what is on it, and an animation held back would be one nothing on
-    /// that screen is going to start.
+    /// `invokeType` decides who plays, here as everywhere else. Arriving on a
+    /// screen is the app deciding to show what is on it — it is not the
+    /// [trigger] call a `trigger` animation is still waiting for, and starting
+    /// one here played animations the app had said it would start itself. Those
+    /// are returned to their initial values instead, so the screen offers them
+    /// from the top when the app does trigger them. The editor's play button
+    /// does stand in for the app, which is what [isEditorPlaying] keeps true
+    /// here.
+    ///
+    /// A cancellation goes with the screen that was cancelled on: the app's next
+    /// [trigger] on this one is answered rather than dropped.
     fun restartAll() {
         // The editor owns the transport while it is attached — see
         // [isEditorAttached]. The playhead is left where the editor put it as
@@ -2222,15 +2228,25 @@ class InertiaPlaybackController internal constructor() {
 
         // Every prefix rather than every state, the way [resumePlayback] reads
         // the registered ones: an animation waiting on the app has no state to
-        // mark, and it is exactly one of the animations this is here to play.
-        // The schemas as well as the registrations, because the container's
-        // effects run before the composition of the screen it has just switched
-        // to — an actionable arriving on that screen has a track here before it
-        // has registered.
-        (registered.keys + schemas.keys).toList().forEach { prefix -> markTriggered(prefix) }
+        // mark, and an `auto` one is exactly what this is here to play. The
+        // schemas as well as the registrations, because the container's effects
+        // run before the composition of the screen it has just switched to — an
+        // actionable arriving on that screen has a track here before it has
+        // registered.
+        (registered.keys + schemas.keys).toList().forEach { prefix ->
+            val isAuto = invokeTypeOf(prefix) == InertiaAnimationInvokeType.auto || isEditorPlaying
 
-        // Nothing has registered yet: whatever does will start itself, and a
-        // clock with nothing to draw is one this need not hold open.
+            states[prefix] = InertiaAnimationState(
+                id = prefix,
+                trigger = isAuto,
+                isCancelled = false
+            )
+        }
+
+        // Nothing has registered yet, or this screen is all `trigger` animations
+        // waiting on the app: either way there is no run for the playhead to
+        // follow, and a clock with nothing to draw is one this need not hold
+        // open.
         if (!hasTriggeredActionable) return
 
         startClock()
@@ -2371,6 +2387,14 @@ class InertiaPlaybackController internal constructor() {
 
     private val hasTriggeredActionable: Boolean
         get() = states.values.any { it.trigger == true && !it.isCancelled }
+
+    /// What decides whether an animation starts itself, from whichever of the
+    /// two halves has arrived: an actionable registers with its `invokeType`,
+    /// and the schema carries the same one for a track whose actionable has not
+    /// entered the composition yet. Nothing known about the prefix means nothing
+    /// says it plays on its own.
+    private fun invokeTypeOf(hierarchyIdPrefix: String): InertiaAnimationInvokeType? =
+        registered[hierarchyIdPrefix] ?: schemas[hierarchyIdPrefix]?.invokeType
 
     private fun markTriggered(hierarchyIdPrefix: String) {
         states[hierarchyIdPrefix] = InertiaAnimationState(

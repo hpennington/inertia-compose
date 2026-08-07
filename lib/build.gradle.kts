@@ -32,6 +32,16 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+
+    testOptions {
+        unitTests {
+            // The playback controller logs its decisions through `android.util.Log`,
+            // which throws on the JVM the unit tests run on. Returning defaults
+            // instead lets a test drive the controller itself rather than only
+            // the pure track maths beside it.
+            isReturnDefaultValues = true
+        }
+    }
 }
 
 repositories {
