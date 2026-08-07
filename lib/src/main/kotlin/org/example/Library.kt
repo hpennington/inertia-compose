@@ -2111,6 +2111,21 @@ class InertiaPlaybackController internal constructor() {
     /// to start.
     private var isEditorPlaying: Boolean = false
 
+    /// Whether the editor is on the other end — the container's `dev`.
+    ///
+    /// The editor owns the transport while it is attached, so nothing in here
+    /// starts a run by itself: an `auto` animation is authored to play as soon
+    /// as the app shows it, but an app being authored *against* is one whose
+    /// animation the editor is playing, pausing and scrubbing, and a run that
+    /// started on its own is one the play button never asked for and the
+    /// timeline is not sitting at. Everything waits for [resumePlayback], which
+    /// is what that button reaches.
+    ///
+    /// Set by the container from the same flag that decides whether the socket
+    /// is opened at all, so a shipped build — where no play button is ever
+    /// coming — is unaffected.
+    internal var isEditorAttached: Boolean = false
+
     /// Whether something asked for a run the clock could not start because the
     /// container was not holding a schema yet — the race [setSchemas] settles.
     /// Cleared the moment a run does start, so schemas handed over again later
@@ -2180,6 +2195,47 @@ class InertiaPlaybackController internal constructor() {
         startClock()
     }
 
+    /// Rewinds the playhead and plays every animation in this container from the
+    /// top.
+    ///
+    /// What a container reaches for when it is handed a new `hierarchyId`: the
+    /// screen just navigated to plays its animations again rather than holding
+    /// the final frame of the run they finished the first time round. The same
+    /// call as the SwiftUI runtime's `InertiaDataModel.restartAll()` and the
+    /// React runtime's `InertiaPlaybackController.restartAll()`.
+    ///
+    /// Every animation, whatever its `invokeType` and whether or not it was
+    /// cancelled — the same breadth as the editor's play button, for the same
+    /// reason [restart] clears a cancellation: arriving on a screen is a decision
+    /// to show what is on it, and an animation held back would be one nothing on
+    /// that screen is going to start.
+    fun restartAll() {
+        // The editor owns the transport while it is attached — see
+        // [isEditorAttached]. The playhead is left where the editor put it as
+        // well as stopped: rewinding it here would move the run out from under a
+        // timeline that is still drawn at the time it was parked at.
+        if (isEditorAttached && !isEditorPlaying) return
+
+        stopClock()
+        playheadTime = 0f
+        seekTime = null
+
+        // Every prefix rather than every state, the way [resumePlayback] reads
+        // the registered ones: an animation waiting on the app has no state to
+        // mark, and it is exactly one of the animations this is here to play.
+        // The schemas as well as the registrations, because the container's
+        // effects run before the composition of the screen it has just switched
+        // to — an actionable arriving on that screen has a track here before it
+        // has registered.
+        (registered.keys + schemas.keys).toList().forEach { prefix -> markTriggered(prefix) }
+
+        // Nothing has registered yet: whatever does will start itself, and a
+        // clock with nothing to draw is one this need not hold open.
+        if (!hasTriggeredActionable) return
+
+        startClock()
+    }
+
     fun isCancelled(id: String): Boolean =
         states[id]?.isCancelled == true
 
@@ -2223,6 +2279,10 @@ class InertiaPlaybackController internal constructor() {
     internal fun register(hierarchyIdPrefix: String, invokeType: InertiaAnimationInvokeType) {
         registered[hierarchyIdPrefix] = invokeType
 
+        // Nothing starts itself while the editor is attached — see
+        // [isEditorAttached]. An actionable that appears mid-run under a playing
+        // editor still joins it, which is what the second half says.
+        if (isEditorAttached && !isEditorPlaying) return
         if (invokeType != InertiaAnimationInvokeType.auto && !isEditorPlaying) return
         if (states.containsKey(hierarchyIdPrefix)) return
 
@@ -3422,6 +3482,13 @@ fun InertiaContainer(
     val guides = remember { InertiaGuideState() }
     val toolHandles = remember { InertiaToolHandleState() }
 
+    // Who owns the transport: with the editor attached, every run comes from its
+    // play button rather than from an `auto` animation starting itself. Applied
+    // as a side effect of the composition, which is dispatched before the
+    // effects the actionables below register in — an `auto` one that got as far
+    // as `register` first would be a run the editor never asked for.
+    SideEffect { playback.isEditorAttached = dev }
+
     val context = LocalContext.current
 
     /// Outside the editor the schemas come from the shipped animation file
@@ -3539,6 +3606,28 @@ fun InertiaContainer(
                 guides.hide()
             }
         }
+    }
+
+    /// Plays this container's animations again whenever the app hands it a new
+    /// `hierarchyId`.
+    ///
+    /// A `hierarchyId` is what the app names the screen this container is
+    /// currently showing, so a change of one is a navigation — and the screen
+    /// arrived at should play its animations rather than hold the last frame of
+    /// the run they finished the first time it was up. The SwiftUI and React
+    /// runtimes restart on the same signal.
+    ///
+    /// Not on the first `hierarchyId` this container is given: the animations of
+    /// the screen the app opened on start themselves as their schemas arrive,
+    /// and a restart on entering the composition would cut that run short. A
+    /// [LaunchedEffect] runs on the composition it is keyed into as well as on
+    /// every change of its key, which is what the remembered id is for.
+    val playedHierarchyId = remember { mutableStateOf(hierarchyId) }
+    LaunchedEffect(hierarchyId) {
+        if (playedHierarchyId.value == hierarchyId) return@LaunchedEffect
+
+        playedHierarchyId.value = hierarchyId
+        playback.restartAll()
     }
 
     /// The hierarchy this container is currently building, and what the editor
