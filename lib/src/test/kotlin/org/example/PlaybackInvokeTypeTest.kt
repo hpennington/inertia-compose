@@ -112,16 +112,41 @@ class PlaybackInvokeTypeTest {
         assertTrue(subject.isPlaying("card1"), "the auto animation plays whatever the app cancelled")
     }
 
+    /// A navigation plays under an attached editor as well, paused transport and
+    /// all — the one place playback does not wait for it. The tab was switched
+    /// in the app rather than on the timeline, and what the arriving screen does
+    /// is the thing being watched. Held back here, switching tabs played on the
+    /// SwiftUI and React runtimes and not on this one.
+    @Test
+    fun `restartAll plays under a paused editor`() {
+        val subject = controller()
+
+        subject.isEditorAttached = true
+        subject.register("card1", InertiaAnimationInvokeType.auto)
+        subject.applySignal(AnimationSignal.Pause, 1)
+
+        subject.restartAll()
+
+        assertTrue(subject.isPlaying("card1"))
+        assertTrue(subject.isRunning)
+        assertEquals(0f, subject.playheadTime)
+        assertNull(subject.seekTime)
+    }
+
     /// A screen of nothing but `trigger` animations has no run for the playhead
-    /// to follow.
+    /// to follow, and the editor should see its clock parked.
     @Test
     fun `restartAll with nothing to play leaves the clock down`() {
         val subject = InertiaPlaybackController()
         subject.setSchemas(mapOf("card0" to schema("card0", InertiaAnimationInvokeType.trigger)))
 
+        var lastReport: MessagePlaybackProgress? = null
+        subject.onProgress = { lastReport = it }
+
         subject.register("card0", InertiaAnimationInvokeType.trigger)
         subject.restartAll()
 
         assertFalse(subject.isRunning)
+        assertEquals(false, lastReport?.isRunning, "the editor is told the run it was following has stopped")
     }
 }

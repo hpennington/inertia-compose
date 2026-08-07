@@ -2243,13 +2243,19 @@ class InertiaPlaybackController internal constructor() {
     ///
     /// A cancellation goes with the screen that was cancelled on: the app's next
     /// [trigger] on this one is answered rather than dropped.
+    ///
+    /// Plays under an attached editor as well, which is the one place this does
+    /// not defer to it — see [isEditorAttached]. Everything else in here waits
+    /// for the transport because the editor is the one deciding when the
+    /// timeline runs; a navigation is not the timeline, it is the app deciding
+    /// to show a screen, and watching what that screen does on arrival is the
+    /// whole of why it is being watched in an editor. Held back on a paused
+    /// transport, switching tabs left this runtime holding the frame the last
+    /// screen ended on while the other two played, which is what the editor's
+    /// user saw as the three runtimes disagreeing. The playhead does move out
+    /// from under the parked timeline, but the transport follows the reports
+    /// this sends and lands back on what the app is showing.
     fun restartAll() {
-        // The editor owns the transport while it is attached — see
-        // [isEditorAttached]. The playhead is left where the editor put it as
-        // well as stopped: rewinding it here would move the run out from under a
-        // timeline that is still drawn at the time it was parked at.
-        if (isEditorAttached && !isEditorPlaying) return
-
         stopClock()
         playheadTime = 0f
         seekTime = null
@@ -2274,8 +2280,13 @@ class InertiaPlaybackController internal constructor() {
         // Nothing has registered yet, or this screen is all `trigger` animations
         // waiting on the app: either way there is no run for the playhead to
         // follow, and a clock with nothing to draw is one this need not hold
-        // open.
-        if (!hasTriggeredActionable) return
+        // open. Said out loud, the way the other two runtimes say it, so an
+        // editor that was following the run this just stopped sees it park
+        // rather than being left drawing a run nothing is playing.
+        if (!hasTriggeredActionable) {
+            report(isRunning = false)
+            return
+        }
 
         startClock()
     }
